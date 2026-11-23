@@ -1,0 +1,100 @@
+{
+  "policy_version": 1,
+  "default_license_mode": "full",
+  "note": "All third-party CLEC sources are cleared for full-text local retrieval. Raw files are read-only and never copied into this repository.",
+  "sources": {
+    "drive_text": {
+      "enabled": true,
+      "path": "sources/drive/text",
+      "body": true,
+      "kind": "doc",
+      "quality": 1,
+      "license_mode": "full"
+    },
+    "local_text": {
+      "enabled": true,
+      "path": "text/local",
+      "body": true,
+      "kind": "doc",
+      "quality": 1,
+      "license_mode": "full",
+      "spreadsheet_mode": "header_and_summary_only"
+    },
+    "clec_md": {
+      "enabled": true,
+      "path": "sources/clec-md",
+      "body": true,
+      "kind": "qa_or_summary",
+      "quality": 2,
+      "license_mode": "full"
+    },
+    "drive_transcripts": {
+      "enabled": true,
+      "path": "sources/drive/archive-transcripts",
+      "body": true,
+      "kind": "transcript",
+      "quality": 2,
+      "license_mode": "full",
+      "prefer": "srt_only"
+    },
+    "clectw_transcripts": {
+      "enabled": true,
+      "path": "web/clectw/transcripts",
+      "body": true,
+      "kind": "transcript",
+      "quality": 2,
+      "license_mode": "full"
+    },
+    "clectw_summaries": {
+      "enabled": true,
+      "path": "web/clectw/text",
+      "body": true,
+      "kind": "summary",
+      "quality": 3,
+      "license_mode": "full"
+    },
+    "asr_transcripts": {
+      "enabled": true,
+      "paths": [
+        "transcripts/local-asr",
+        "transcripts/podcast-asr"
+      ],
+      "body": true,
+      "kind": "transcript",
+      "quality": 2,
+      "license_mode": "full",
+      "hallucination_gate": true
+    },
+    "cfnavi": {
+      "enabled": true,
+      "path": "web/cfnavi",
+      "body": true,
+      "kind": "summary",
+      "quality": 3,
+      "license_mode": "full"
+    },
+    "clec168": {
+      "enabled": true,
+      "path": "web/clec168",
+      "body": true,
+      "kind": "doc",
+      "quality": 1,
+      "license_mode": "full",
+      "skip_video_intro_pages": true
+    },
+    "podcast_metadata": {
+      "enabled": true,
+      "path": "sources/podcast",
+      "body": false,
+      "purpose": "metadata_only",
+      "license_mode": "full"
+    },
+    "quarantine": {
+      "enabled": false,
+      "path": "transcripts/quarantine",
+      "body": false,
+      "blocked_works": ["ep-00176", "ep-00260", "ep-00295"],
+      "license_mode": "full"
+    }
+  }
+}

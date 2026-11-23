@@ -1,0 +1,333 @@
+"""Independent quality audit for the CLEC corpus.
+
+This script does not trust the build report.  It reads every line of
+``dist/corpus.jsonl`` and independently verifies the Stage-1 hard thresholds,
+then writes ``dist/etl-audit.md`` with the size comparison, template removal
+examples and real ``quality=4`` samples.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+from . import schema
+
+BLOCKED = ("ep-00176", "ep-00260", "ep-00295")
+TEMPLATE_PATTERNS = {
+    "web_capture_header": re.compile(
+        r"(?m)^\s*(?:来源|來源)\s*:\s*https?://(?:www\.)?"
+        r"(?:clec168|clectw|cfnavi|drive\.google|docs\.google)"
+    ),
+    "capture_timestamp": re.compile(r"(?m)^\s*(?:采集时间|採集時間)\s*:\s*\d{4}-"),
+    "player_control": re.compile(r"(?m)^\s*播完自動接下一集\s*$"),
+    "transcript_disclaimer": re.compile(r"※\s*逐字稿由影片語音"),
+    "related_episodes": re.compile(r"▶\s*相關集數"),
+    "related_articles": re.compile(r"(?m)^\s*(?:全部文章|更多文章|全部影片|更多影片)\s*$"),
+    "mailing_list": re.compile(r"(?m)^\s*郵件清單\s*$"),
+    "pager": re.compile(r"(?m)^\s*(?:上一頁|上一页|下一頁|下一页)\s*$"),
+    "ai_page_disclaimer": re.compile(r"本頁內容由 AI"),
+    "resource_downloads": re.compile(r"(?m)^\s*本集講義／教材（可下載）"),
+    "author_category_labels": re.compile(r"(?m)^\s*(?:作者|分類)\s*$"),
+    "presentation_metadata": re.compile(
+        r"(?m)^\s*(?:原始檔名|原始\s*PDF|相關資料|上一篇簡報|下一篇簡報)\s*[：:]?"
+    ),
+    "drive_header_labels": re.compile(
+        r"(?m)^\s*(?:标题|文件类型|文件類型|提取方法)\s*[：:]"
+    ),
+    "favorite_chrome": re.compile(r"(?m)^\s*收藏\s*$"),
+    "video_intro": re.compile(r"無法播放此影片|影片資訊\s*\d{5}"),
+}
+THRESHOLD_TEMPLATE = 0.005
+THRESHOLD_COMPLEMENT = 2000
+THRESHOLD_LENGTH = 0.95
+
+
+def load_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def template_hits(rows: list[dict]) -> tuple[list[dict], Counter]:
+    hits: list[dict] = []
+    counter: Counter = Counter()
+    for row in rows:
+        haystack = "\n".join(
+            str(row.get(key, "")) for key in ("title", "heading", "body")
+        )
+        matched = [name for name, pattern in TEMPLATE_PATTERNS.items() if pattern.search(haystack)]
+        if matched:
+            counter.update(matched)
+            hits.append(
+                {
+                    "doc_id": row.get("doc_id", ""),
+                    "work_id": row.get("work_id", ""),
+                    "source_id": row.get("source_id", ""),
+                    "patterns": matched,
+                    "excerpt": haystack[:240],
+                }
+            )
+    return hits, counter
+
+
+def blocked_hits(rows: list[dict]) -> list[dict]:
+    hits: list[dict] = []
+    for row in rows:
+        text = "\n".join(
+            str(row.get(key, "")) for key in ("work_id", "source_id", "doc_id", "title", "body")
+        ).lower()
+        for blocked in BLOCKED:
+            if blocked in text:
+                hits.append({"doc_id": row.get("doc_id", ""), "blocked": blocked})
+    return hits
+
+
+def drive_duplicate_hits(rows: list[dict]) -> list[dict]:
+    hits = []
+    for row in rows:
+        source_id = str(row.get("source_id", ""))
+        if source_id.startswith(("drive_txt_", "drive_md_")):
+            hits.append({"doc_id": row.get("doc_id", ""), "source_id": source_id})
+    # A work must not have two Drive transcript sources.
+    by_work: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        if str(row.get("source_id", "")).startswith("drive_srt_"):
+            by_work[row["work_id"]].append(row["source_id"])
+    for work_id, source_ids in by_work.items():
+        if len(set(source_ids)) > 1:
+            hits.append({"work_id": work_id, "source_ids": sorted(set(source_ids))})
+    return hits
+
+
+def clec168_video_hits(rows: list[dict]) -> list[dict]:
+    hits = []
+    for row in rows:
+        source_id = str(row.get("source_id", ""))
+        haystack = "\n".join(str(row.get(key, "")) for key in ("title", "body"))
+        if source_id.startswith("c168_video_") or re.search(r"無法播放此影片|影片資訊\s*\d{5}", haystack):
+            hits.append({"doc_id": row.get("doc_id", ""), "source_id": source_id})
+    return hits
+
+
+def complement_works(rows: list[dict]) -> tuple[int, int]:
+    kinds: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        kinds[row.get("work_id", "")].add(row.get("kind", ""))
+    with_both = sum(
+        1 for values in kinds.values()
+        if "transcript" in values and "summary" in values
+    )
+    with_many = sum(1 for values in kinds.values() if len(values) > 1)
+    return with_both, with_many
+
+
+def format_table(rows: list[list[str]], headers: list[str]) -> str:
+    lines = ["| " + " | ".join(headers) + " |",
+             "|" + "|".join(["---"] * len(headers)) + "|"]
+    for row in rows:
+        lines.append("| " + " | ".join(str(cell) for cell in row) + " |")
+    return "\n".join(lines)
+
+
+def build_report(
+    corpus_path: Path,
+    meta_path: Path,
+    out_path: Path,
+    stats_path: Path,
+    samples_path: Path,
+) -> tuple[str, bool]:
+    rows = list(schema.iter_corpus(corpus_path))
+    meta = load_json(meta_path)
+    stats = load_json(stats_path)
+    samples = load_json(samples_path)
+    metrics = schema.audit_rows(rows)
+    total = len(rows)
+
+    hits, pattern_counter = template_hits(rows)
+    template_rate = len(hits) / total if total else 0.0
+    blocked = blocked_hits(rows)
+    drive_dupes = drive_duplicate_hits(rows)
+    video_hits = clec168_video_hits(rows)
+    with_both, with_many = complement_works(rows)
+    quality4 = [row for row in rows if row.get("quality") == 4]
+    license_full = all(row.get("license_mode") == "full" for row in rows)
+    podcast_body = [
+        row for row in rows
+        if str(row.get("source_id", "")).startswith("podcast_meta_")
+        or str(row.get("source_id", "")).startswith("podcast_rss_")
+    ]
+
+    known_gaps = "\n".join(meta.get("known_gaps", []))
+    known_gaps_ok = all(blocked_id in known_gaps for blocked_id in BLOCKED)
+
+    checks = [
+        ("Schema 全部通过（doc_id/ordinal/日期/UTF-8）", not metrics["errors"], f"{len(metrics['errors'])} errors"),
+        ("段落长度 100–900 字比例 ≥ 95%", metrics["length_ok_ratio"] >= THRESHOLD_LENGTH, f"{metrics['length_ok_ratio']:.2%}"),
+        ("网页模板命中率 < 0.5%", template_rate < THRESHOLD_TEMPLATE, f"{template_rate:.4%} ({len(hits)}/{total})"),
+        ("隔离区 ep-00176/00260/00295 泄露 = 0", not blocked, f"{len(blocked)} hits"),
+        ("known_gaps 准确记录 3 集", known_gaps_ok, "yes" if known_gaps_ok else "no"),
+        ("Drive 同组 TXT/SRT/MD 重复 = 0", not drive_dupes, f"{len(drive_dupes)} hits"),
+        ("transcript + summary 互补作品 ≥ 2,000", with_both >= THRESHOLD_COMPLEMENT, f"{with_both}"),
+        ("clec168 纯视频介绍页入正文 = 0", not video_hits, f"{len(video_hits)} hits"),
+        ("sources/podcast 正文 = 0", not podcast_body, f"{len(podcast_body)} hits"),
+        ("license_mode 全量 = full", license_full, "yes" if license_full else "no"),
+        ("quality=4 真实样例 ≥ 10", len(quality4) >= 10, f"{len(quality4)}"),
+        ("meta 统计与 corpus 一致", meta.get("counts", {}).get("passages") == total, f"meta={meta.get('counts', {}).get('passages')} corpus={total}"),
+    ]
+    passed = all(ok for _, ok, _ in checks)
+
+    summary_rows = [
+        [name, "PASS" if ok else "FAIL", detail]
+        for name, ok, detail in checks
+    ]
+
+    source_rows = []
+    labels = stats.get("source_labels", {})
+    for key, value in stats.get("sources", {}).items():
+        source_rows.append([
+            labels.get(key, key),
+            value.get("files", 0),
+            f"{value.get('raw_chars', 0):,}",
+            value.get("docs_before_dedup", 0),
+            value.get("docs_after_dedup", 0),
+            value.get("skipped", 0),
+            value.get("passages", 0),
+            f"{value.get('passage_chars', 0):,}",
+        ])
+    totals = [
+        "合计",
+        sum(row[1] for row in source_rows),
+        f"{sum(int(str(row[2]).replace(',', '')) for row in source_rows):,}",
+        sum(row[3] for row in source_rows),
+        sum(row[4] for row in source_rows),
+        sum(row[5] for row in source_rows),
+        sum(row[6] for row in source_rows),
+        f"{sum(int(str(row[7]).replace(',', '')) for row in source_rows):,}",
+    ]
+    source_rows.append(totals)
+
+    template_examples = samples.get("template_examples", [])[:10]
+    template_sections = []
+    for index, example in enumerate(template_examples, 1):
+        template_sections.append(
+            f"### 样例 {index}：{example.get('source_path', '')}\n\n"
+            f"- 规则：`{', '.join(example.get('rules', []))}`\n\n"
+            f"**清洗前（原始抓取）**\n\n```text\n{example.get('before', '')}\n```\n\n"
+            f"**清洗后（入正文）**\n\n```text\n{example.get('after', '')}\n```\n"
+        )
+    if not template_sections:
+        template_sections.append("_未找到可展示的模板剥离样例。_\n")
+
+    suspect_sections = []
+    for index, sample in enumerate(samples.get("suspect_examples", [])[:10], 1):
+        suspect_sections.append(
+            f"### 样例 {index}：`{sample.get('doc_id', '')}`\n\n"
+            f"- work_id：`{sample.get('work_id', '')}`\n"
+            f"- 触发原因：`{'; '.join(sample.get('reasons', []))}`\n"
+            f"- zlib 比：{sample.get('compression_ratio')}，"
+            f"最高 5-gram 重复：{sample.get('max_repeat_count')} 次，"
+            f"覆盖率：{sample.get('repeat_coverage')}\n\n"
+            f"```text\n{sample.get('body', '')[:620]}\n```\n"
+        )
+    if not suspect_sections:
+        suspect_sections.append("_未找到 quality=4 样例。_\n")
+
+    error_sections = ""
+    if metrics["errors"]:
+        error_sections = "## Schema 错误\n\n" + "\n".join(f"- {item}" for item in metrics["errors"][:30]) + "\n"
+    hit_sections = ""
+    if hits:
+        hit_sections = "## 模板残留命中\n\n" + format_table(
+            [[h["doc_id"], ", ".join(h["patterns"]), h["excerpt"][:120].replace("\n", " ")] for h in hits[:20]],
+            ["doc_id", "patterns", "excerpt"],
+        ) + "\n"
+
+    report = f"""# CLEC 语料 ETL 独立质量审计
+
+- 生成时间：{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}
+- corpus：`{corpus_path}`
+- meta：`{meta_path}`
+- 总段落数：{total:,}
+- 结论：**{'PASS' if passed else 'FAIL'}**
+
+## 硬阈值验收
+
+{format_table(summary_rows, ['验收项', '结果', '实测值'])}
+
+## 清洗前后规模对比
+
+{format_table(source_rows, ['来源', '文件数', '原始字符', '去重前文档', '去重后文档', '跳过', '段落数', '正文字符'])}
+
+- 去重：{stats.get('dedup', {}).get('before', 'n/a')} → {stats.get('dedup', {}).get('after', 'n/a')} 个文档；同作品同类型合并 {stats.get('dedup', {}).get('same_work_merges', 'n/a')}，5-gram 近重复合并 {stats.get('dedup', {}).get('near_duplicate_merges', 'n/a')}。
+- 隔离区跳过：{stats.get('skipped_blocked', 'n/a')} 个文件/文档。
+- 同一 work_id 同时含 transcript 与 summary：**{with_both:,}**；多形态互补作品：{with_many:,}。
+
+## 契约与分布
+
+- 类型分布：{json.dumps(metrics['by_kind'], ensure_ascii=False)}
+- 质量分布：{json.dumps(metrics['by_quality'], ensure_ascii=False)}
+- 年份分布：{json.dumps(metrics['by_year'], ensure_ascii=False)}
+- 段落长度 100–900 字：{metrics['length_ok']:,} / {total:,} = {metrics['length_ok_ratio']:.2%}
+- `doc_id` 唯一数：{total - len(metrics['duplicate_doc_ids']) if not metrics['duplicate_doc_ids'] else 'FAIL'}
+- 来源数：{metrics['sources']:,}
+
+{error_sections}
+## 已知缺口
+
+```text
+{known_gaps}
+```
+
+## 被剥离模板的真实前后对比（10 条）
+
+{''.join(template_sections)}
+
+## quality=4（suspect）真实样例（10 条）
+
+{''.join(suspect_sections)}
+
+## 模板正则统计
+
+{format_table([[name, count] for name, count in pattern_counter.most_common()], ['模板规则', '残留命中数']) if pattern_counter else '_全量零命中。_'}
+
+{hit_sections}
+## 复现命令
+
+```bash
+python3 -m etl.build_corpus --source-dir /Users/century/Vibing/clec/collection --out-dir dist
+python3 -m etl.audit_corpus --corpus dist/corpus.jsonl --meta dist/meta.json --out dist/etl-audit.md
+python3 -m pytest -q
+```
+"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(report, encoding="utf-8")
+    return report, passed
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--corpus", type=Path, default=Path("dist/corpus.jsonl"))
+    parser.add_argument("--meta", type=Path, default=Path("dist/meta.json"))
+    parser.add_argument("--out", type=Path, default=Path("dist/etl-audit.md"))
+    parser.add_argument("--stats", type=Path, default=Path("dist/build-stats.json"))
+    parser.add_argument("--samples", type=Path, default=Path("dist/audit-samples.json"))
+    args = parser.parse_args(argv)
+    if not args.corpus.exists():
+        parser.error(f"corpus not found: {args.corpus}")
+    report, passed = build_report(
+        args.corpus, args.meta, args.out, args.stats, args.samples
+    )
+    # Print the conclusion table for CI logs.
+    print(report.split("## 清洗前后规模对比")[0])
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
