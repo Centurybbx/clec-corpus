@@ -1291,6 +1291,22 @@ def deduplicate_cross_work_passages(
     return kept
 
 
+def assign_passage_other_kinds(passages: list[dict]) -> None:
+    """Backfill ``other_kinds`` from the final, de-duplicated passages.
+
+    A map keyed only by ``work_id`` is wrong when a work has several
+    documents of different kinds: the last document overwrites the earlier
+    ones and every passage receives the same (possibly self-referential)
+    list.  Aggregate the kinds that actually survived into ``passages`` and
+    compute the complement for each individual row instead.
+    """
+    kinds_by_work: dict[str, set[str]] = defaultdict(set)
+    for row in passages:
+        kinds_by_work[row["work_id"]].add(row["kind"])
+    for row in passages:
+        row["other_kinds"] = sorted(kinds_by_work[row["work_id"]] - {row["kind"]})
+
+
 # ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------
@@ -1405,12 +1421,7 @@ def build(source_dir: Path, out_dir: Path) -> dict:
     priority_by_source = {doc["source_id"]: doc["priority"] for doc in docs}
     pre_cross_work_count = len(passages)
     passages = deduplicate_cross_work_passages(passages, priority_by_source)
-    docs = dedup.annotate_other_kinds(docs)
-    other_kinds_by_work = {
-        doc["work_id"]: list(doc.get("other_kinds", [])) for doc in docs
-    }
-    for row in passages:
-        row["other_kinds"] = other_kinds_by_work.get(row["work_id"], [])
+    assign_passage_other_kinds(passages)
 
     final_counts = Counter(row["source_id"] for row in passages)
     for entry in manifest:

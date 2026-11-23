@@ -74,6 +74,27 @@ THRESHOLD_TEMPLATE = 0.005
 THRESHOLD_COMPLEMENT = 2000
 THRESHOLD_LENGTH = 0.95
 
+# Residual title branding / subscription CTA.  A title is flagged when the
+# channel brand is effectively at the end (only a short noise fragment may
+# follow and it must not contain a date).  Semantic mentions such as
+# "CLEC 投資理財頻道的成功分享 2025-02-02" are not suffixes and must not be
+# reported as template pollution.
+TITLE_CHANNEL_TOKEN = re.compile(
+    r"(?i)(?:[|｜]\s*)?(?:CLEC|CLE|CRAC)?\s*"
+    r"(?:投資理財(?:教育)?頻道|投資(?:理財|教育)?頻道|理財投資頻道|"
+    r"投理財頻道|投資裡材頻道|投在理財頻道)"
+)
+TITLE_DATE = re.compile(
+    r"\d{4}\s*[年/.\-]\s*\d{1,2}"
+    r"|\d{1,2}\s*[/⁄.]\s*\d{1,2}\s*[/⁄.]\s*\d{2,4}"
+)
+TITLE_CTA = re.compile(
+    r"漏掉我們的直播通知"
+    r"|(?:訂[閲閱]|订阅)\s*👍"
+    r"|(?:開啟|打開|打开)\s*鈴鐺"
+    r"|(?:請訂閱|請訂閲|請订阅)\s*[、,，]?\s*(?:分享|轉發|转发|按)"
+)
+
 
 def load_json(path: Path) -> dict:
     try:
@@ -130,6 +151,65 @@ def template_hits(rows: list[dict]) -> tuple[list[dict], Counter]:
                 }
             )
     return hits, counter
+
+
+def other_kinds_mismatches(rows: list[dict]) -> list[dict]:
+    """Rows whose ``other_kinds`` disagrees with the final corpus itself.
+
+    The expected set is derived independently from every surviving passage:
+    the union of ``other_kinds`` and the row's own kind must equal all kinds
+    that actually exist for that ``work_id``, and a row may never list its
+    own kind as complementary.
+    """
+    actual_kinds: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        actual_kinds[str(row.get("work_id", ""))].add(str(row.get("kind", "")))
+    mismatches: list[dict] = []
+    for row in rows:
+        work_id = str(row.get("work_id", ""))
+        kind = str(row.get("kind", ""))
+        others = row.get("other_kinds")
+        if not isinstance(others, list):
+            others = []
+        expected = actual_kinds[work_id] - {kind}
+        if kind in others or set(others) != expected:
+            mismatches.append(
+                {
+                    "doc_id": row.get("doc_id", ""),
+                    "work_id": work_id,
+                    "kind": kind,
+                    "other_kinds": list(others),
+                    "expected": sorted(expected),
+                }
+            )
+    return mismatches
+
+
+def title_template_hits(rows: list[dict]) -> list[dict]:
+    """Find channel-suffix or subscription-CTA residue in final titles."""
+    hits: list[dict] = []
+    for row in rows:
+        title = str(row.get("title", "") or "")
+        patterns: list[str] = []
+        matches = list(TITLE_CHANNEL_TOKEN.finditer(title))
+        if matches:
+            match = matches[-1]
+            prefix = title[:match.start()].strip(" \t\u3000|｜-—–•,，;；:：")
+            tail = title[match.end():].strip(" \t\u3000")
+            if len(prefix) >= 2 and len(tail) <= 32 and not TITLE_DATE.search(tail):
+                patterns.append("channel_suffix")
+        if TITLE_CTA.search(title):
+            patterns.append("subscription_cta")
+        if patterns:
+            hits.append(
+                {
+                    "doc_id": row.get("doc_id", ""),
+                    "work_id": row.get("work_id", ""),
+                    "title": title[:240],
+                    "patterns": patterns,
+                }
+            )
+    return hits
 
 
 def blocked_hits(rows: list[dict], blocked_works: tuple[str, ...]) -> list[dict]:
@@ -330,6 +410,8 @@ def build_report(
 
     hits, pattern_counter = template_hits(rows)
     template_rate = len(hits) / total if total else 0.0
+    other_kinds_bad = other_kinds_mismatches(rows)
+    title_hits = title_template_hits(rows)
     blocked = blocked_hits(rows, blocked_works)
     slot_hits = blocked_slot_hits(rows)
     fp_hits = fingerprint_hits(rows)
@@ -363,6 +445,8 @@ def build_report(
 
     checks = [
         ("Schema 全部通过（doc_id/ordinal/日期/UTF-8）", not metrics["errors"], f"{len(metrics['errors'])} errors"),
+        ("other_kinds 逐段互补集合准确（差异 = 0）", not other_kinds_bad, f"{len(other_kinds_bad)} mismatches"),
+        ("标题频道后缀 / 订阅 CTA 残留 = 0", not title_hits, f"{len(title_hits)} rows"),
         ("段落长度 100–900 字比例 ≥ 95%", metrics["length_ok_ratio"] >= THRESHOLD_LENGTH, f"{metrics['length_ok_ratio']:.2%}"),
         ("网页模板命中率 < 0.5%（含制式页尾）", template_rate < THRESHOLD_TEMPLATE, f"{template_rate:.4%} ({len(hits)}/{total})"),
         ("隔离区 ep-00176/00260/00295 泄露 = 0", not blocked, f"{len(blocked)} hits"),
@@ -502,6 +586,8 @@ def build_report(
 - `doc_id` 唯一数：{total - len(metrics['duplicate_doc_ids']) if not metrics['duplicate_doc_ids'] else 'FAIL'}
 - 来源数：{metrics['sources']:,}
 - `ep-02xxx` 伪年份作品：{len(pseudo_years)}
+- `other_kinds` 逐段差异：{len(other_kinds_bad)}
+- 标题频道后缀 / 订阅 CTA 残留：{len(title_hits)}
 - `date == {CAPTURE_DATE}` 段落：{len(capture_dates)}
 - 同源重复时间戳：{len(duplicate_ranges)}；同源重叠：{len(overlaps)}
 - 跨 work 完全相同 body：{len(cross_work_bodies)}

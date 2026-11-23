@@ -364,6 +364,65 @@ def test_audit_helpers_detect_pseudo_years_dates_and_duplicate_ranges():
     assert len(audit_corpus.overlapping_time_ranges(contiguous)) == 0
 
 
+def test_passage_other_kinds_are_derived_from_final_passages():
+    passages = [
+        _row(doc_id="summary-0", work_id="ep-00123", kind="summary", other_kinds=[]),
+        _row(doc_id="summary-1", work_id="ep-00123", kind="summary", other_kinds=[]),
+        _row(doc_id="transcript-0", work_id="ep-00123", kind="transcript", other_kinds=[]),
+        _row(doc_id="solo-0", work_id="solo-work", kind="doc", other_kinds=[]),
+    ]
+    build_corpus.assign_passage_other_kinds(passages)
+    by_id = {row["doc_id"]: row for row in passages}
+    assert by_id["summary-0"]["other_kinds"] == ["transcript"]
+    assert by_id["summary-1"]["other_kinds"] == ["transcript"]
+    assert by_id["transcript-0"]["other_kinds"] == ["summary"]
+    assert by_id["solo-0"]["other_kinds"] == []
+
+
+def test_audit_detects_other_kinds_mismatches_and_title_residue():
+    good = [
+        _row(doc_id="s", work_id="ep-00123", kind="summary", other_kinds=["transcript"]),
+        _row(doc_id="t", work_id="ep-00123", kind="transcript", other_kinds=["summary"]),
+    ]
+    assert audit_corpus.other_kinds_mismatches(good) == []
+
+    bad = [
+        _row(doc_id="s", work_id="ep-00123", kind="summary", other_kinds=["summary"]),
+        _row(doc_id="t", work_id="ep-00123", kind="transcript", other_kinds=["transcript"]),
+    ]
+    mismatches = audit_corpus.other_kinds_mismatches(bad)
+    assert len(mismatches) == 2
+    assert {item["expected"][0] for item in mismatches} == {"summary", "transcript"}
+
+    titles = [
+        _row(doc_id="a", title="正常標題"),
+        _row(
+            doc_id="b",
+            title="【00123】市場不貴 02/20/2020 CLEC 投資理財教育頻道",
+        ),
+        _row(
+            doc_id="c",
+            title="【00123】市場不貴 建議大家 訂閲頻道，才不會漏掉我們的直播通知。",
+        ),
+    ]
+    hits = audit_corpus.title_template_hits(titles)
+    assert {hit["doc_id"] for hit in hits} == {"b", "c"}
+    assert {tuple(hit["patterns"]) for hit in hits} == {
+        ("channel_suffix",),
+        ("subscription_cta",),
+    }
+
+
+def test_audit_ignores_semantic_channel_mentions_in_titles():
+    rows = [
+        _row(
+            doc_id="semantic",
+            title="CLEC 投資理財頻道的成功分享 2025年2月2日",
+        )
+    ]
+    assert audit_corpus.title_template_hits(rows) == []
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: low-confidence Drive SRT keeps both works
 # ---------------------------------------------------------------------------

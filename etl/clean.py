@@ -122,6 +122,51 @@ SITE_SUFFIXES = (
     re.compile(r"\s*[—–-]\s*乘豐領航生命艦隊\s*$"),
     re.compile(r"\s*[—–-]\s*CLEC\s*投資理財\s*$"),
 )
+# YouTube/clectw episode titles often carry the channel brand and a
+# subscription call-to-action.  The brand appears with and without a space,
+# in Traditional and Simplified Chinese, and occasionally with ASR typos.
+TITLE_CHANNEL_TOKEN = re.compile(
+    r"(?i)(?:[|｜]\s*)?(?:CLEC|CLE|CRAC)?\s*"
+    r"(?:投資理財(?:教育)?頻道|投資(?:理財|教育)?頻道|理財投資頻道|"
+    r"投理財頻道|投資裡材頻道|投在理財頻道)"
+)
+# Text that may legitimately follow the brand at the very end of a title:
+# language/subtitle notes, file extensions, "簡報資料", a pasted URL, a date-
+# like fragment or a stray bracket.  Only strip the brand when the remainder
+# is one of these noise fragments; a semantic mention such as
+# "CLEC 投資理財頻道的成功分享" must stay intact.
+TITLE_CHANNEL_TAIL = re.compile(
+    r"^(?:"
+    r"[（(【［\[].*"
+    r"|在\s*[（(【［\[].*"
+    r"|[）)\]】］]"
+    r"|mp4|mov|m4a|院|金|在|_+|\d{1,3}"
+    r"|\d{1,3}\s*(?:複製|拷貝)"
+    r"|\d{1,2}\s*多語音"
+    r"|\d{1,2}[;:：]\d{2}\s*(?:am|pm)"
+    r"|簡報資料"
+    r"|重要資訊.*"
+    r"|博文日期.*"
+    r"|[|｜].*"
+    r"|[‘’“”'\"«»]"
+    r"|[。．.！!]+"
+    r")$"
+)
+TITLE_CTA_PAREN = re.compile(
+    r"\s*[（(][^（）()]{0,160}?(?:訂[閲閱]|订阅)[^（）()]{0,160}?[）)]"
+)
+TITLE_CTA_CLAUSE = re.compile(
+    r"(?:建議大家|請大家|歡迎大家|請留言|請訂|記得訂|別忘了訂)\s*"
+    r"[^。！!\n】]{0,40}?"
+    r"(?:直播通知|通知|轉發|转发|分享|鈴鐺|铃铛|👍|感謝|感谢)"
+    r"[^。！!\n】]{0,30}[。！!]?"
+    r"|(?:訂[閲閱]|订阅)\s*[、,]\s*(?:分享|轉發|转发|按\s*👍)"
+    r"[^。！!\n】]{0,30}[。！!]?"
+)
+TITLE_CTA_TAIL = re.compile(
+    r"\s*(?:訂[閲閱]|订阅)\s*👍?\s*(?:轉發|转发|分享)\s*[！!]?"
+    r"|\s*(?:訂[閲閱]|订阅)\s*👍"
+)
 AUDIO_SUFFIX = re.compile(r"\s*\(\s*\d+\s*kbit[_A-Za-z]*\s*\)\s*$", re.I)
 FILE_SUFFIX = re.compile(
     r"(?:\.(?:txt|md|srt|vtt|html?|json|pdf|docx?|pptx?|xlsx?|epub|zip))+$",
@@ -195,6 +240,28 @@ def strip_web_noise(text: str) -> str:
     return text
 
 
+def _strip_title_channel_suffix(value: str) -> str:
+    """Drop a trailing channel brand, keeping semantic channel mentions.
+
+    Only the last brand occurrence is considered.  The suffix is removed when
+    at least two characters of real title precede it and whatever follows is
+    a known noise fragment (bracketed note, file extension, date-like paste,
+    etc.).  A title consisting solely of the channel name is left untouched
+    so the caller can fall back to a valid, non-empty title.
+    """
+    matches = list(TITLE_CHANNEL_TOKEN.finditer(value))
+    if not matches:
+        return value
+    match = matches[-1]
+    prefix = value[:match.start()].strip(" \t\u3000|｜-—–•,，;；:：")
+    tail = value[match.end():].strip(" \t\u3000")
+    if len(prefix) < 2:
+        return value
+    if tail and not TITLE_CHANNEL_TAIL.match(tail):
+        return value
+    return prefix
+
+
 def normalize_title(title: str, fallback: str = "") -> str:
     """Normalise a display title without converting Traditional/Simplified."""
     value = repair_text(html.unescape(title or "")).strip()
@@ -208,11 +275,16 @@ def normalize_title(title: str, fallback: str = "") -> str:
         value = FILE_SUFFIX.sub("", value)
     for suffix in SITE_SUFFIXES:
         value = suffix.sub("", value)
+    original = value
+    value = TITLE_CTA_PAREN.sub(" ", value)
+    value = TITLE_CTA_CLAUSE.sub(" ", value)
+    value = TITLE_CTA_TAIL.sub("", value)
+    value = _strip_title_channel_suffix(value)
     value = URL_RE.sub("", value)
     value = value.strip(" \t'\"“”‘’")
     value = MULTISPACE.sub(" ", value).strip()
     if not value:
-        value = normalize_whitespace(fallback)
+        value = normalize_whitespace(fallback) or original.strip()
     return value
 
 

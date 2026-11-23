@@ -95,6 +95,60 @@ def test_drive_header_variant_and_source_citation():
     assert result.text.startswith("正文開始")
 
 
+def test_normalize_title_strips_channel_suffix_and_subscription_cta():
+    title = (
+        "【00123】投資理財 市場不貴！回報低長期風險最高。"
+        "長期投資指數基金，風險低，就富有。 "
+        "建議大家 訂閲頻道，才不會漏掉我們的直播通知。訂閲👍轉發！ "
+        "02/20/2020 CLEC 投資理財教育頻道"
+    )
+    assert clean.normalize_title(title) == (
+        "【00123】投資理財 市場不貴！回報低長期風險最高。"
+        "長期投資指數基金，風險低，就富有。 02/20/2020"
+    )
+
+    cta = (
+        "【00167】CLEC 讓更多錢為你工作、Tesla Q3銷售新高、買賣原則、"
+        "投資永遠不嫌晚 （請訂閱、分享、按 👍，開啟鈴鐺 🔔！感謝🙏）"
+        "2020年10月9日 CLEC 投資頻道"
+    )
+    assert clean.normalize_title(cta) == (
+        "【00167】CLEC 讓更多錢為你工作、Tesla Q3銷售新高、買賣原則、"
+        "投資永遠不嫌晚 2020年10月9日"
+    )
+
+    quoted = (
+        "00469(一） 別人的投資是別人的事 2024年6月1日 "
+        "CLEC投資理財教育頻道‘"
+    )
+    assert clean.normalize_title(quoted) == (
+        "00469(一） 別人的投資是別人的事 2024年6月1日"
+    )
+
+
+def test_normalize_title_keeps_semantic_channel_mention():
+    title = (
+        "多語音短篇從實踐中學習：CLEC 投資理財頻道指導下的投資經驗和收穫的"
+        "真實案例分享 2025年2月13日 CLEC 投資理財頻道"
+    )
+    assert clean.normalize_title(title) == (
+        "多語音短篇從實踐中學習：CLEC 投資理財頻道指導下的投資經驗和收穫的"
+        "真實案例分享 2025年2月13日"
+    )
+    semantic = "短篇 一個可以穿越時空的投資頻道！ 2023年11月10日 CLEC投資理財頻道"
+    assert clean.normalize_title(semantic) == (
+        "短篇 一個可以穿越時空的投資頻道！ 2023年11月10日"
+    )
+
+
+def test_normalize_title_keeps_a_valid_title_when_stripping_would_empty_it():
+    assert clean.normalize_title("CLEC 投資理財頻道") == "CLEC 投資理財頻道"
+    assert clean.normalize_title(
+        "CLEC 投資理財頻道重要資訊連結與最新公告"
+    ) == "CLEC 投資理財頻道重要資訊連結與最新公告"
+    assert clean.normalize_title("normal title") == "normal title"
+
+
 def test_cfnavi_removes_capture_label_social_card_and_nav():
     raw = """来源: https://cfnavi.org/cat-clec/clec2026/cl-568/
 
