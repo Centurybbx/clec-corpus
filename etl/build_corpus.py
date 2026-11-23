@@ -24,6 +24,7 @@ from typing import Iterable
 from . import chunk, clean, dedup, hallucination, schema
 
 BLOCKED_WORKS = ("ep-00176", "ep-00260", "ep-00295")
+DEFAULT_BLOCKED_WORKS = BLOCKED_WORKS
 KIND_QUALITY = {"doc": 1, "transcript": 2, "qa": 2, "summary": 3}
 KIND_ORDER = ("doc", "transcript", "qa", "summary")
 CURRENT_PACK_VERSION = date.today().isoformat()
@@ -115,13 +116,17 @@ def make_doc(
     raw_before: str = "",
     priority: int | None = None,
 ) -> dict:
+    normalized_date = clean.normalize_date(date_value)
+    capture_date = clean.capture_date_from_text(raw_before)
+    if normalized_date and capture_date and normalized_date == capture_date:
+        normalized_date = None
     return {
         "work_id": work_id,
         "source_id": source_id,
         "title": title or work_id,
         "kind": kind,
         "quality": KIND_QUALITY[kind],
-        "date": clean.normalize_date(date_value),
+        "date": normalized_date,
         "text": text,
         "heading": heading or "",
         "start_sec": None,
@@ -148,6 +153,15 @@ def load_policy() -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
+
+
+_SOURCE_POLICY = load_policy()
+BLOCKED_WORKS = tuple(
+    (_SOURCE_POLICY.get("sources") or {})
+    .get("quarantine", {})
+    .get("blocked_works")
+    or DEFAULT_BLOCKED_WORKS
+)
 
 
 # ---------------------------------------------------------------------------
@@ -196,14 +210,56 @@ class ClectwIndex:
         meta = self.meta.get(stem, {})
         return meta.get("date")
 
+    def duration_for(self, stem: str) -> int | None:
+        meta = self.meta.get(stem, {})
+        return meta.get("duration_sec")
+
     def origin_for(self, stem: str) -> str:
         meta = self.meta.get(stem, {})
         return meta.get("origin_url", f"https://clectw.com/ep/{stem}")
 
 
+NUMBER_TOKEN = re.compile(r"(?<!\d)(\d{4,6})([A-Za-z])?(?!\d)")
+EXPLICIT_NUMBER_PATTERNS = (
+    re.compile(r"【\s*(\d{4,6})([A-Za-z])?\s*】"),
+    re.compile(r"[（(]\s*(\d{4,6})([A-Za-z])?\s*[）)]"),
+    re.compile(r"(?i)(?:第|ep|集)\s*(\d{4,6})([A-Za-z])?"),
+    re.compile(r"(?:^|[\s，,。；;])(\d{4,6})([A-Za-z])?(?=[\s【（(『「，,。；;]|$)"),
+)
+
+
+def _is_year(number: str) -> bool:
+    return len(number) == 4 and 1990 <= int(number) <= 2035
+
+
+def _identifier(number: str, suffix: str = "") -> str:
+    if len(number) == 4:
+        number = number.zfill(5)
+    return number + (suffix or "").lower()
+
+
+def _work_hints(text: str) -> list[str]:
+    lower = text.lower()
+    hints: list[str] = []
+    if "短篇" in text or "短片" in text or "short" in lower:
+        hints.append("short")
+    if "漫談" in text or "漫谈" in text or "talk" in lower:
+        hints.append("talk")
+    if "緣起" in text or "缘起" in text:
+        hints.append("origin")
+    if "閒聊" in text or "闲聊" in text or "chat" in lower:
+        hints.append("chat")
+    if "專題" in text or "专题" in text or "special" in lower:
+        hints.append("special")
+    hints.append("ep")
+    return hints
+
+
 def _stem_candidates(stem_set: set[str], identifier: str) -> list[str]:
-    needle = f"-{identifier.lower()}"
-    return sorted(stem for stem in stem_set if stem.endswith(needle))
+    """Match ``-<id>`` and split-episode suffixes such as ``ep-00480a``."""
+    escaped = re.escape(identifier.lower())
+    pattern = re.compile(rf"-{escaped}[a-z]?$")
+    return sorted(stem for stem in stem_set if pattern.search(stem.lower()))
 
 
 def infer_work_id(
@@ -213,38 +269,51 @@ def infer_work_id(
     fallback: str,
     allow_unique_fallback: bool = True,
 ) -> str:
-    """Map a document title to a clectw work stem when possible."""
+    """Map a document title to a clectw work stem when possible.
+
+    Four-digit years (1990-2035) are never treated as episode numbers.  A bare
+    number is only turned into ``ep-xxxxx`` when the title has explicit episode
+    context (``【00694】``, ``第 123 集``, ``EP123``, a leading ID column, or a
+    parenthesised number).  Otherwise the caller's stable fallback ID wins.
+    """
     text = clean.normalize_title(title)
-    match = re.search(r"(?<!\d)(\d{4,6})([A-Za-z])?(?!\d)", text)
-    if not match:
-        return fallback
-    number, suffix = match.group(1), (match.group(2) or "").lower()
-    if len(number) == 4:
-        number = number.zfill(5)
-    identifier = number + suffix
     lower = text.lower()
-    hints: list[str] = []
-    if "短篇" in text or "短片" in text or "short" in lower:
-        hints.append("short")
-    if "漫談" in text or re.search(r"\bep\s*\d+", lower):
-        hints.append("talk")
-    if "緣起" in text:
-        hints.append("origin")
-    if "閒聊" in text:
-        hints.append("chat")
-    if "專題" in text:
-        hints.append("special")
-    hints.append("ep")
-    for hint in hints:
-        candidate = f"{hint}-{identifier}"
-        if candidate in stem_set:
-            return candidate
-    candidates = _stem_candidates(stem_set, identifier)
-    if len(candidates) == 1 and allow_unique_fallback:
-        return candidates[0]
-    if "貼文" in text or "post" in lower:
-        return f"post-{number}"
-    return f"ep-{identifier}"
+
+    identifiers: list[str] = []
+    for match in NUMBER_TOKEN.finditer(text):
+        number, suffix = match.group(1), (match.group(2) or "")
+        if _is_year(number):
+            continue
+        identifier = _identifier(number, suffix)
+        if identifier not in identifiers:
+            identifiers.append(identifier)
+
+    hints = _work_hints(text)
+    for identifier in identifiers:
+        for hint in hints:
+            candidate = f"{hint}-{identifier}"
+            if candidate in stem_set:
+                return candidate
+        candidates = _stem_candidates(stem_set, identifier)
+        if len(candidates) == 1 and allow_unique_fallback:
+            return candidates[0]
+
+    if ("貼文" in text or "post" in lower) and identifiers:
+        return f"post-{identifiers[0]}"
+
+    for pattern in EXPLICIT_NUMBER_PATTERNS:
+        for match in pattern.finditer(text):
+            number, suffix = match.group(1), (match.group(2) or "")
+            if _is_year(number):
+                continue
+            identifier = _identifier(number, suffix)
+            for hint in hints:
+                candidate = f"{hint}-{identifier}"
+                if candidate in stem_set:
+                    return candidate
+            return f"ep-{identifier}"
+
+    return fallback
 
 
 def best_match(
@@ -286,6 +355,7 @@ class Builder:
             }
         )
         self.skipped_blocked = 0
+        self.superseded_versions = 0
         self.template_examples: list[dict] = []
         self.clectw = ClectwIndex(source_dir)
         self.policy = load_policy()
@@ -415,24 +485,36 @@ class Builder:
             title = cleaned.meta.get("title") or path.stem
             origin_match = re.search(r"(?m)^\s*来源\s*:\s*(https?://\S+)", raw)
             origin_url = origin_match.group(1) if origin_match else ""
+            cues = chunk.parse_cue_markdown(cleaned.text)
+            text = "".join(cue.text for cue in cues) if cues else cleaned.text
             fallback = f"drive-doc-{short_hash(path.stem)}"
-            work_id = infer_work_id(
-                title, stem_set=self.clectw.stems, fallback=fallback
-            )
+            identity = clean.book_identity(title) or clean.book_identity(path.name)
+            if identity:
+                group, version, _language = identity
+                work_id = f"book-{group}"
+            else:
+                group, version = "", ()
+                work_id = infer_work_id(
+                    title, stem_set=self.clectw.stems, fallback=fallback
+                )
             doc = make_doc(
                 work_id=work_id,
                 source_id=f"drive_doc_{safe_slug(path.stem)}",
                 title=title,
                 kind="doc",
-                text=cleaned.text,
+                text=text,
                 source_type="drive_text",
                 source_path=path,
                 source_dir=self.root,
                 date_value=clean.first_date(title),
                 origin_url=origin_url,
+                cues=cues or None,
                 rules=cleaned.rules,
                 raw_before=raw,
             )
+            if group:
+                doc["book_group"] = group
+                doc["book_version"] = version
             self.collect_example(doc)
             self.add(doc, raw_chars=len(raw))
 
@@ -445,17 +527,25 @@ class Builder:
         for path in sorted(directory.rglob("*.txt")):
             raw = read_text(path)
             is_spreadsheet = path.name.lower().endswith((".xlsx.txt", ".xls.txt"))
+            scenario_match = re.search(r"\((\d{1,3})%\)", path.name)
+            scenario = f"{scenario_match.group(1)}%" if scenario_match else ""
             if is_spreadsheet:
-                cleaned = clean.clean_spreadsheet(raw)
+                cleaned = clean.clean_spreadsheet(raw, scenario=scenario)
             else:
                 cleaned = clean.clean_local_document(raw)
             title = clean.normalize_title(path.name)
             title = re.sub(r"\.(?:pdf|docx?|pptx?|xlsx?|epub)\.txt$", "", title, flags=re.I)
             title = clean.normalize_title(title)
             fallback = f"local-{short_hash(path.name)}"
-            work_id = infer_work_id(
-                title, stem_set=self.clectw.stems, fallback=fallback
-            )
+            identity = clean.book_identity(title) or clean.book_identity(path.name)
+            if identity:
+                group, version, _language = identity
+                work_id = f"book-{group}"
+            else:
+                group, version = "", ()
+                work_id = infer_work_id(
+                    title, stem_set=self.clectw.stems, fallback=fallback
+                )
             doc = make_doc(
                 work_id=work_id,
                 source_id=f"local_{safe_slug(path.parent.name)}_{safe_slug(path.stem)}",
@@ -469,6 +559,11 @@ class Builder:
                 rules=cleaned.rules,
                 raw_before=raw,
             )
+            if scenario:
+                doc["scenario"] = scenario
+            if group:
+                doc["book_group"] = group
+                doc["book_version"] = version
             self.collect_example(doc)
             self.add(doc, raw_chars=len(raw))
 
@@ -559,7 +654,9 @@ class Builder:
             if is_blocked(inferred):
                 self.skip("drive_transcripts", raw_chars=len(raw_srt), blocked=True)
                 continue
-            work_id = self.map_drive_work(group, title, text, inferred)
+            work_id = self.map_drive_work(
+                group, title, text, inferred, duration=cues[-1].end
+            )
             if is_blocked(work_id):
                 self.skip("drive_transcripts", raw_chars=len(raw_srt), blocked=True)
                 continue
@@ -580,32 +677,82 @@ class Builder:
             )
             self.add(doc, raw_chars=len(raw_srt))
 
-    def map_drive_work(self, group: str, title: str, text: str, inferred: str) -> str:
-        """Align a Drive SRT group with its clectw work when confident."""
+    def map_drive_work(
+        self,
+        group: str,
+        title: str,
+        text: str,
+        inferred: str,
+        *,
+        duration: float = 0.0,
+    ) -> str:
+        """Align a Drive SRT group with its clectw work only when confident.
+
+        A low-confidence content match must never replace the clectw verbatim
+        transcript.  The old code fell back to the title identifier even when
+        the two texts had zero overlap (``drive_srt_00070`` -> ``short-00001``)
+        or mismatched durations (27-minute clip -> 3h18 Clubhouse episode).
+        """
         query = dedup.shingles(text)
-        identifier_match = re.search(r"(?<!\d)(\d{4,6})([A-Za-z])?(?!\d)", clean.normalize_title(title))
-        candidates: dict[str, set[int]] = {}
-        if identifier_match:
-            number = identifier_match.group(1)
-            if len(number) == 4:
-                number = number.zfill(5)
-            identifier = (number + (identifier_match.group(2) or "")).lower()
-            for stem in _stem_candidates(self.clectw.stems, identifier):
-                if stem in self.clectw.shingles:
-                    candidates[stem] = self.clectw.shingles[stem]
-        match, score = best_match(query, candidates, minimum=0.08)
+        if not query:
+            return f"drive-{group}"
+
+        identifiers: list[str] = []
+        for match in NUMBER_TOKEN.finditer(clean.normalize_title(title)):
+            number, suffix = match.group(1), (match.group(2) or "")
+            if _is_year(number):
+                continue
+            identifier = _identifier(number, suffix)
+            if identifier not in identifiers:
+                identifiers.append(identifier)
+
+        candidate_stems: set[str] = set()
+        for identifier in identifiers:
+            candidate_stems.update(_stem_candidates(self.clectw.stems, identifier))
+        if inferred and inferred in self.clectw.stems:
+            candidate_stems.add(inferred)
+        candidates = {
+            stem: self.clectw.shingles[stem]
+            for stem in candidate_stems
+            if stem in self.clectw.shingles and not is_blocked(stem)
+        }
+        match, score = self._best_content_match(query, candidates, duration)
         if match:
             return match
 
-        # No reliable same-number match.  For titles without a usable ID (the
-        # 2018 physical-course uploads) try a global content match.
-        if not identifier_match:
-            match, score = best_match(query, self.clectw.shingles, minimum=0.18)
-            if match:
-                return match
-        if inferred in self.clectw.stems:
-            return inferred
+        # No exact stem, or the same-number candidate was not convincing:
+        # allow a global content match with a duration guard.
+        match, score = self._best_content_match(
+            query, self.clectw.shingles, duration, minimum=0.45
+        )
+        if match:
+            return match
         return f"drive-{group}"
+
+    def _best_content_match(
+        self,
+        query: set[int],
+        candidates: dict[str, set[int]],
+        duration: float,
+        *,
+        minimum: float = 0.45,
+    ) -> tuple[str | None, float]:
+        best_stem = None
+        best_score = 0.0
+        for stem, grams in candidates.items():
+            if not grams or is_blocked(stem):
+                continue
+            reference = self.clectw.duration_for(stem)
+            if duration > 0 and reference:
+                ratio = min(duration, reference) / max(duration, reference)
+                if ratio < 0.70:
+                    continue
+            score = dedup.containment(query, grams)
+            if score > best_score:
+                best_stem, best_score = stem, score
+        if best_score < minimum:
+            return None, best_score
+        return best_stem, best_score
 
     # -- ASR transcripts -------------------------------------------------
 
@@ -885,6 +1032,41 @@ class Builder:
 
     # -- metadata fill ---------------------------------------------------
 
+    def finalize_book_versions(self) -> None:
+        """Keep only the newest / most complete edition of each book.
+
+        ``CLEC 寶典`` and ``The Wisdom of CLEC`` exist as V1.5.1 (local text)
+        and V1.14.2 (Drive text); keeping both produces thousands of exact
+        duplicate passages across different ``work_id`` values.
+        """
+        groups: dict[str, list[dict]] = defaultdict(list)
+        for doc in self.docs:
+            if doc.get("book_group"):
+                groups[doc["book_group"]].append(doc)
+        removed = 0
+        for group, docs in groups.items():
+            if len(docs) <= 1:
+                continue
+            winner = max(
+                docs,
+                key=lambda doc: (
+                    tuple(doc.get("book_version") or ()),
+                    len(doc.get("text", "")),
+                    int(doc.get("priority", 0)),
+                    doc.get("source_id", ""),
+                ),
+            )
+            for doc in docs:
+                if doc is winner:
+                    continue
+                doc["superseded_by"] = winner["source_id"]
+                self.docs.remove(doc)
+                stats = self.stats[doc["source_type"]]
+                stats["docs_before_dedup"] = max(0, stats["docs_before_dedup"] - 1)
+                stats["skipped"] += 1
+                removed += 1
+        self.superseded_versions = removed
+
     def fill_work_metadata(self) -> None:
         dates: dict[str, str] = {}
         origins: dict[str, str] = {}
@@ -996,11 +1178,13 @@ def build_passages(docs: list[dict]) -> tuple[list[dict], list[dict]]:
             chunks = chunk.chunk_plain_transcript(doc["text"])
         else:
             chunks = chunk.chunk_prose(doc["text"])
+        if not chunks and len(clean.normalize_whitespace(doc["text"])) >= chunk.MIN_KEEP:
+            chunks = chunk.force_chunk(doc["text"])
         source_hash = short_hash(doc["source_id"])
         ordinal = 0
         for piece in chunks:
             body = clean.strip_web_noise(piece.body).strip()
-            if len(body) < chunk.MIN_KEEP:
+            if len(body) < chunk.MIN_FRAGMENT:
                 continue
             quality = doc["quality"]
             if doc["kind"] == "transcript":
@@ -1043,6 +1227,68 @@ def build_passages(docs: list[dict]) -> tuple[list[dict], list[dict]]:
             )
             ordinal += 1
     return passages, suspect_examples
+
+
+def make_doc_manifest(docs: list[dict], passages: list[dict]) -> list[dict]:
+    """Record per-document passage production for the independent audit."""
+    counts = Counter(row["source_id"] for row in passages)
+    manifest: list[dict] = []
+    for doc in docs:
+        text_chars = len(clean.normalize_whitespace(doc.get("text", "")))
+        manifest.append(
+            {
+                "source_id": doc["source_id"],
+                "work_id": doc["work_id"],
+                "kind": doc["kind"],
+                "text_chars": text_chars,
+                "passage_count": counts.get(doc["source_id"], 0),
+            }
+        )
+    return manifest
+
+
+def deduplicate_cross_work_passages(
+    passages: list[dict],
+    priority_by_source: dict[str, int],
+) -> list[dict]:
+    """Drop exact ``body`` duplicates that appear under different works.
+
+    Keeps the higher-priority source and renumbers ordinals/``doc_id`` so the
+    contract's contiguous-ordinal invariant still holds.
+    """
+    by_body: dict[str, list[int]] = defaultdict(list)
+    for index, row in enumerate(passages):
+        by_body[row["body"]].append(index)
+    drop: set[int] = set()
+    for indices in by_body.values():
+        if len(indices) < 2:
+            continue
+        if len({passages[index]["work_id"] for index in indices}) < 2:
+            continue
+        winner = max(
+            indices,
+            key=lambda index: (
+                priority_by_source.get(passages[index]["source_id"], 0),
+                -index,
+            ),
+        )
+        winner_source = passages[winner]["source_id"]
+        for index in indices:
+            if passages[index]["source_id"] != winner_source:
+                drop.add(index)
+
+    kept = [row for index, row in enumerate(passages) if index not in drop]
+    counters: dict[str, int] = defaultdict(int)
+    for row in kept:
+        source_id = row["source_id"]
+        ordinal = counters[source_id]
+        counters[source_id] = ordinal + 1
+        row["ordinal"] = ordinal
+        row["doc_id"] = (
+            f"p_{safe_slug(row['work_id'])}_{row['kind'][:2]}_"
+            f"{short_hash(source_id)}_{ordinal:04d}"
+        )
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -1134,12 +1380,41 @@ def build(source_dir: Path, out_dir: Path) -> dict:
     for source_key, reader in readers:
         if builder.enabled(source_key):
             reader()
+    builder.finalize_book_versions()
     builder.fill_work_metadata()
 
     result = dedup.deduplicate_documents(builder.docs)
-    docs = dedup.annotate_other_kinds(result.kept)
+    docs = result.kept
     docs.sort(key=lambda item: (item["source_type"], item["source_id"]))
     passages, suspect_examples = build_passages(docs)
+
+    # Hard invariant: every cleaned document of at least 100 characters must
+    # produce at least one passage.  A build that drops a whole document is a
+    # failure, not a silent statistics change.
+    manifest = make_doc_manifest(docs, passages)
+    zero_passage_docs = [
+        entry for entry in manifest
+        if entry["text_chars"] >= chunk.MIN_KEEP and entry["passage_count"] == 0
+    ]
+    if zero_passage_docs:
+        names = ", ".join(entry["source_id"] for entry in zero_passage_docs[:10])
+        raise RuntimeError(
+            f"docs_with_zero_passages={len(zero_passage_docs)}: {names}"
+        )
+
+    priority_by_source = {doc["source_id"]: doc["priority"] for doc in docs}
+    pre_cross_work_count = len(passages)
+    passages = deduplicate_cross_work_passages(passages, priority_by_source)
+    docs = dedup.annotate_other_kinds(docs)
+    other_kinds_by_work = {
+        doc["work_id"]: list(doc.get("other_kinds", [])) for doc in docs
+    }
+    for row in passages:
+        row["other_kinds"] = other_kinds_by_work.get(row["work_id"], [])
+
+    final_counts = Counter(row["source_id"] for row in passages)
+    for entry in manifest:
+        entry["final_passage_count"] = final_counts.get(entry["source_id"], 0)
 
     # Per-source post-dedup/passage stats.
     for doc in docs:
@@ -1157,6 +1432,11 @@ def build(source_dir: Path, out_dir: Path) -> dict:
     with corpus_path.open("w", encoding="utf-8", newline="\n") as handle:
         for row in passages:
             handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    manifest_path = out_dir / "doc-manifest.jsonl"
+    with manifest_path.open("w", encoding="utf-8", newline="\n") as handle:
+        for entry in manifest:
+            handle.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     meta = make_meta(passages)
     (out_dir / "meta.json").write_text(
@@ -1192,6 +1472,9 @@ def build(source_dir: Path, out_dir: Path) -> dict:
         },
         "skipped_blocked": builder.skipped_blocked,
         "blocked_works": list(BLOCKED_WORKS),
+        "book_versions_removed": builder.superseded_versions,
+        "cross_work_exact_passages_removed": pre_cross_work_count - len(passages),
+        "docs_with_zero_passages": len(zero_passage_docs),
         "complements": dedup.complement_counts(docs),
     }
     (out_dir / "build-stats.json").write_text(
@@ -1201,6 +1484,7 @@ def build(source_dir: Path, out_dir: Path) -> dict:
     return {
         "corpus": str(corpus_path),
         "meta": str(out_dir / "meta.json"),
+        "manifest": str(manifest_path),
         "passages": len(passages),
         "works": meta["counts"]["works"],
         "stats": stats_payload,

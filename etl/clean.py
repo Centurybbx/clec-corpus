@@ -86,6 +86,36 @@ CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 REPLACEMENT_CHARS = re.compile("[\ufffd\ufeff]")
 MULTI_BLANK = re.compile(r"\n{3,}")
 TRAILING_SPACE = re.compile(r"[ \t]+\n")
+CAPTURE_DATE = re.compile(r"(?m)^\s*(?:采集时间|採集時間)\s*:\s*(\d{4}-\d{2}-\d{2})")
+# Standard clectw / blog page footer.  The lookahead keeps the rule limited to
+# the tail of a document so a book chapter that discusses risk is not cut.
+STANDARD_DISCLAIMER = re.compile(
+    r"(?s)(?:免責宣告|免责宣告|免責聲明|免责声明|投資風險預告|投资风险预告|"
+    r"風險預告|风险预告)\s*[：:]?.{0,100}?"
+    r"投資有風險\s*[，,]\s*入市需謹慎[。.!！]?"
+    r"(?:\s*(?:感謝觀看|感謝收看|谢谢观看|謝謝觀看|記得訂閱[^\n]*|"
+    r"在Apple Podcast上聆聽[^\n]*|在Spotify Podcast上聆聽[^\n]*|"
+    r"Spotify Podcast[^\n]*|Follow 我們的 Facebook[^\n]*|"
+    r"\[email protected\][^\n]*|CLEC 投資理財頻道重要資訊[^\n]*)[。.!！]?)*\s*\Z"
+)
+FOOTER_MARKERS = (
+    "在Apple Podcast上聆聽",
+    "在Spotify Podcast上聆聽",
+    "Spotify Podcast",
+    "Follow 我們的 Facebook",
+    "[email protected]",
+    "CLEC 投資理財頻道重要資訊",
+)
+FOOTER_LINE = re.compile(
+    r"(?m)^\s*(?:在Apple Podcast上聆聽|在Spotify Podcast上聆聽|Spotify Podcast|"
+    r"Follow 我們的 Facebook[^\n]*|\[email protected\][^\n]*|"
+    r"CLEC 投資理財頻道重要資訊[^\n]*)\s*$\n?"
+)
+CELL_COORD = re.compile(r"^\s*[A-Z]{1,3}\d+\s*:\s*")
+CELL_COORD_ANY = re.compile(r"(?:^|(?<=\s))[A-Z]{1,3}\d+\s*:\s*")
+LOCAL_PATH = re.compile(r"(?:/Users/[^\s\t]+|/Volumes/[^\s\t]+|[A-Za-z]:\\\\Users\\\\[^\s\t]+)")
+FORMULA_NOTE = re.compile(r"\s*\[公式:[^\]]*\]")
+VERSION_RE = re.compile(r"(?i)(?:^|[_\-\s])v?(\d{1,3}(?:\.\d{1,3}){1,3})(?:[_\-\s.]|$)")
 SITE_SUFFIXES = (
     re.compile(r"\s*[|｜]\s*CLEC\s*投資理財\s*$"),
     re.compile(r"\s*[—–-]\s*CLEC\s*(?:台灣|臺灣)\s*$"),
@@ -136,6 +166,7 @@ class ClectwPage:
 def repair_text(text: str) -> str:
     """Normalise newlines and remove characters that break JSONL cleanliness."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = html.unescape(text)
     text = text.replace("\u00a0", " ").replace("\u2028", "\n").replace("\u2029", "\n")
     text = CONTROL_CHARS.sub("", text)
     text = REPLACEMENT_CHARS.sub("", text)
@@ -232,6 +263,7 @@ def normalize_date(value: object) -> str | None:
     patterns = (
         (r"(?<!\d)(\d{4})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})(?!\d)", (1, 2, 3)),
         (r"(?<!\d)(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*[日號号]?", (1, 2, 3)),
+        (r"(?<!\d)(\d{4})\s+(\d{1,2})\s*月\s*(\d{1,2})\s*[日號号]?", (1, 2, 3)),
         (r"(?<!\d)(\d{1,2})\s*/\s*(\d{1,2})\s*/\s*(\d{4})(?!\d)", (3, 1, 2)),
         (r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)", (1, 2, 3)),
     )
@@ -266,6 +298,98 @@ def first_date(*values: object) -> str | None:
         if result:
             return result
     return None
+
+
+def capture_date_from_text(text: str | None) -> str | None:
+    """Return the ``采集时间`` value of a capture header, if present."""
+    if not text:
+        return None
+    match = CAPTURE_DATE.search(repair_text(text))
+    return normalize_date(match.group(1)) if match else None
+
+
+def parse_duration(text: str) -> int | None:
+    """Parse a clectw header duration such as ``3:18:11`` or ``6:27``."""
+    match = re.search(r"(?<!\d)(\d{1,2}):(\d{2}):(\d{2})(?!\d)", text or "")
+    if match:
+        return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + int(match.group(3))
+    match = re.search(r"(?<!\d)(\d{1,3}):(\d{2})(?!\d)", text or "")
+    if match:
+        return int(match.group(1)) * 60 + int(match.group(2))
+    return None
+
+
+def remove_standard_footer(text: str) -> Cleaned:
+    """Strip only the site-wide footer, never a body paragraph about risk.
+
+    The disclaimer rule is anchored at ``\\Z`` (allowing only known footer
+    links afterwards), so a book chapter that discusses
+    ``投資有風險，入市需謹慎`` in the middle of its prose is left untouched.
+    """
+    before = text
+    rules: list[str] = []
+    match = STANDARD_DISCLAIMER.search(text)
+    if match and match.start() >= min(80, len(text) // 2):
+        text = text[: match.start()].rstrip()
+        rules.append("clectw_standard_disclaimer")
+    elif match:
+        # Very short documents may be nothing but the footer; keep the body
+        # before it if there is one, otherwise drop the footer.
+        head = text[: match.start()].strip()
+        if len(head) >= 40:
+            text = head
+            rules.append("clectw_standard_disclaimer")
+
+    # Blog / X-post footers are concatenated into the last line.  Truncate
+    # from the first footer marker when it appears in the trailing section.
+    positions = [text.find(marker) for marker in FOOTER_MARKERS]
+    positions = [pos for pos in positions if pos >= 0]
+    if positions:
+        pos = min(positions)
+        tail = text[pos:]
+        if pos >= len(text) * 0.5 or len(tail) <= 400:
+            text = text[:pos].rstrip(" \t，,。；;：:")
+            rules.append("podcast_social_footer")
+    if FOOTER_LINE.search(text):
+        text = FOOTER_LINE.sub("", text)
+        rules.append("podcast_social_footer")
+    return Cleaned(text=text, rules=list(dict.fromkeys(rules)), before=before)
+
+
+def book_identity(name: str) -> tuple[str, tuple[int, ...], str] | None:
+    """Identify versioned books by normalised title + language/script.
+
+    Returns ``(group, version_tuple, language)`` or ``None``.  The grouping is
+    intentionally conservative: only known CLEC book families with an
+    explicit version number are collapsed, so unrelated lecture notes are not
+    merged into one work.
+    """
+    value = normalize_title(name or "")
+    lower = value.lower()
+    family = ""
+    base = ""
+    if "wisdom-of-clec" in lower or "wisdom of clec" in lower or "clec寶典" in lower or "clec宝典" in lower:
+        family, base = "clec-wisdom", "clec-wisdom"
+    elif "wealth-bible" in lower or "wealth bible" in lower or "理財聖經" in lower or "理财圣经" in lower:
+        family, base = "wealth-bible", "wealth-bible"
+    if not family:
+        return None
+    match = VERSION_RE.search(value)
+    if not match:
+        return None
+    try:
+        version = tuple(int(part) for part in match.group(1).split("."))
+    except ValueError:
+        return None
+    language = "zh"
+    if re.search(r"(?i)(?:^|[_\-\s])en(?:[_\-\s.]|$)|英文", value):
+        language = "en"
+    elif re.search(r"(?i)(?:^|[_\-\s])sc(?:[_\-\s.]|$)|简", value):
+        language = "sc"
+    elif re.search(r"(?i)(?:^|[_\-\s])zh(?:[_\-\s.]|$)", value):
+        language = "zh"
+    return f"{base}-{language}", version, language
+
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +428,9 @@ def clean_drive_document(text: str) -> Cleaned:
             rules.append("drive_capture_header_variant")
     text, extra = _remove_source_citation(text)
     rules.extend(extra)
+    standard = remove_standard_footer(text)
+    text = standard.text
+    rules.extend(standard.rules)
     text = normalize_whitespace(text)
     text = normalize_whitespace(strip_web_noise(text))
     return Cleaned(text=text, rules=rules, before=before, meta={"title": title})
@@ -378,14 +505,28 @@ def remove_generic_pager_lines(text: str) -> Cleaned:
 # ---------------------------------------------------------------------------
 
 def parse_clectw_header(text: str) -> dict:
-    """Extract title/category/date from a clectw episode page header."""
-    lines = [line.strip() for line in repair_text(text).splitlines()]
+    """Extract title/category/date/duration from a clectw episode header.
+
+    The capture header must be removed *before* scanning: otherwise the
+    ``采集时间: 2026-11-06`` fallback is mistaken for the episode date and
+    propagated to every Drive transcript of the same work.
+    """
+    text = repair_text(text)
+    text, _ = _strip_capture(text)
+    lines = [line.strip() for line in text.splitlines()]
     category = ""
     title = ""
     date_value = None
+    duration_sec = None
     header_line = ""
     header_index = -1
+    skip_prefixes = (
+        "来源", "來源", "采集时间", "採集時間", "播完",
+        "标题", "標題", "文件类型", "文件類型",
+    )
     for index, line in enumerate(lines[:10]):
+        if line.startswith(skip_prefixes):
+            continue
         if "收藏" in line and len(line) < 80:
             header_line = line
             header_index = index
@@ -393,19 +534,22 @@ def parse_clectw_header(text: str) -> dict:
     if header_index >= 0:
         category = header_line.split()[0] if header_line.split() else ""
         date_value = normalize_date(header_line)
+        duration_sec = parse_duration(header_line)
         for line in lines[header_index + 1:header_index + 4]:
             if line and not line.startswith(("📰", "本集講義", "來源")):
                 title = normalize_title(line)
                 break
     else:
         for line in lines[:8]:
-            if line.startswith(("来源", "來源", "采集时间", "播完")):
+            if line.startswith(skip_prefixes):
                 continue
             if len(line) >= 4:
                 title = normalize_title(line)
                 break
     if not date_value:
         for line in lines[:8]:
+            if line.startswith(skip_prefixes):
+                continue
             date_value = normalize_date(line)
             if date_value:
                 break
@@ -413,6 +557,7 @@ def parse_clectw_header(text: str) -> dict:
         "title": title,
         "category": category,
         "date": date_value,
+        "duration_sec": duration_sec,
         "header_line": header_line,
     }
 
@@ -472,8 +617,11 @@ def clean_clectw_summary(text: str) -> ClectwPage:
             continue
         cleaned_lines.append(line)
     summary = normalize_whitespace(strip_web_noise("\n".join(cleaned_lines)))
+    footer = remove_standard_footer(summary)
+    summary = normalize_whitespace(footer.text)
 
     rules = list(capture_rules)
+    rules.extend(footer.rules)
     if PLAYER_CONTROL.search(before):
         rules.append("episode_player_control")
     if RESOURCE_BLOCK.search(before):
@@ -516,6 +664,9 @@ def clean_clectw_transcript(text: str) -> Cleaned:
     footer = remove_clectw_footer(text)
     text = footer.text
     rules.extend(footer.rules)
+    standard = remove_standard_footer(text)
+    text = standard.text
+    rules.extend(standard.rules)
     return Cleaned(text=normalize_whitespace(strip_web_noise(text)), rules=list(dict.fromkeys(rules)), before=before)
 
 
@@ -547,6 +698,9 @@ def clean_clec168_blog(text: str) -> Cleaned:
     text = re.sub(r"(?m)^\s*\d{4}/\d{1,2}/\d{1,2}\s*$", "", text)
     text = BLOG_MORE.sub("", text)
     text = re.sub(r"(?:來源|来源)\s*[：:]\s*", "", text)
+    standard = remove_standard_footer(text)
+    text = standard.text
+    rules.extend(standard.rules)
     return Cleaned(text=normalize_whitespace(strip_web_noise(text)), rules=list(dict.fromkeys(rules)), before=before)
 
 
@@ -562,6 +716,9 @@ def clean_clec168_doc(text: str) -> Cleaned:
     rules.extend(citation)
     text = PHOTO_CREDIT.sub("", text)
     text = re.sub(r"(?m)^\s*(?:上一頁|上一页|下一頁|下一页)\s*$\n?", "", text)
+    standard = remove_standard_footer(text)
+    text = standard.text
+    rules.extend(standard.rules)
     return Cleaned(text=normalize_whitespace(strip_web_noise(text)), rules=list(dict.fromkeys(rules)), before=before)
 
 
@@ -578,6 +735,9 @@ def clean_clec168_presentation(text: str) -> Cleaned:
     text = re.sub(r"(?m)^\s*\d{5}\s+\d{4}年\d{1,2}月\d{1,2}日\s*$", "", text)
     text = re.sub(r"(?m)^\s*\d{5}\s+\d{4}/\d{1,2}/\d{1,2}\s*$", "", text)
     text = SOURCE_CITATION.sub("", text)
+    standard = remove_standard_footer(text)
+    text = standard.text
+    rules.extend(standard.rules)
     return Cleaned(text=normalize_whitespace(strip_web_noise(text)), rules=list(dict.fromkeys(rules)), before=before)
 
 
@@ -629,6 +789,9 @@ def clean_cfnavi(text: str) -> Cleaned:
     text = "\n".join(cleaned)
     text = re.sub(r"(?m)^\s*#.*$", "", text)  # tag clouds
     text = re.sub(r"\s*pic\.(?:twitter|x)\.com/\S+", "", text)
+    standard = remove_standard_footer(text)
+    text = standard.text
+    rules.extend(standard.rules)
     return Cleaned(
         text=normalize_whitespace(strip_web_noise(text)),
         rules=list(dict.fromkeys(rules)),
@@ -682,44 +845,107 @@ def clean_local_document(text: str) -> Cleaned:
     return Cleaned(text=text, rules=["local_pdf_text"], before=before)
 
 
-def clean_spreadsheet(text: str, max_rows: int = 6) -> Cleaned:
-    """Compact an .xlsx text dump to a header plus a few summary rows.
+def clean_spreadsheet(text: str, max_rows: int = 6, scenario: str = "") -> Cleaned:
+    """Compact an .xlsx text dump while preserving scenario semantics.
 
     The six spreadsheets in ``text/local`` contain 7,713 individual cells.  We
-    keep the sheet name, header row and a handful of data rows so the numbers
-    remain discoverable without flooding the corpus with cell fragments.
+    keep the sheet name, scenario parameter (30% vs 50%), column names and a
+    handful of key summary rows.  Cell coordinates (``B11:``), local absolute
+    paths and formula dumps are removed so the numbers remain searchable
+    without flooding the corpus with cell fragments.
     """
     before = text
     lines = repair_text(text).splitlines()
+    sheets: list[tuple[str, list[str]]] = []
     sheet = ""
-    header: list[str] = []
-    sample: list[str] = []
+    rows: list[str] = []
+
+    def flush() -> None:
+        nonlocal rows
+        if sheet or rows:
+            sheets.append((sheet, rows))
+        rows = []
+
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("--- xl/worksheets/"):
+            flush()
             sheet = stripped.strip("- ").strip()
             continue
-        if not re.match(r"^[A-Z]{1,3}\d+\s*:", stripped):
+        if not CELL_COORD.match(stripped):
             continue
-        # Prefer the first row that looks like a header, then a few data rows.
-        if not header and re.search(r"(?:年份|日期|资产|資產|配置|回报|回報|现金|現金)", stripped):
-            header.append(stripped)
-        elif header and len(sample) < max_rows:
-            sample.append(stripped)
-        if len(header) and len(sample) >= max_rows:
-            break
-    parts = []
-    if sheet:
-        parts.append(f"工作表：{sheet}")
-    if header:
-        parts.append("表頭：" + "；".join(header[:3]))
-    if sample:
-        parts.append("關鍵資料列：" + "；".join(sample[:max_rows]))
+        cleaned = CELL_COORD.sub("", stripped)
+        cleaned = CELL_COORD_ANY.sub("", cleaned)
+        cleaned = LOCAL_PATH.sub("", cleaned)
+        cleaned = FORMULA_NOTE.sub("", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if not cleaned:
+            continue
+        cells = [cell.strip() for cell in cleaned.split("\t") if cell.strip()]
+        if cells:
+            rows.append(" | ".join(cells))
+    flush()
+
+    header_keywords = (
+        "年份", "日期", "資產", "资产", "配置", "回報", "回报", "現金", "现金",
+        "QQQ", "QLD", "開銷", "开销", "負債", "负债", "淨資產", "净资产",
+        "適足率", "适足率", "Beta", "金額", "金额", "比例", "資料", "资料",
+    )
+    parts: list[str] = []
+    if scenario:
+        parts.append(f"情景參數：{scenario}")
+    for sheet_name, row_list in sheets:
+        if not row_list:
+            continue
+        sheet_bits: list[str] = []
+        if sheet_name:
+            sheet_bits.append(f"工作表：{sheet_name}")
+        caption = [
+            row for row in row_list
+            if ("狀況" in row or "资产模拟" in row or "資產模擬" in row
+                or "個人資料" in row or "个人资料" in row or "時間採" in row)
+        ][:5]
+        if caption:
+            sheet_bits.append("情景說明：" + "；".join(dict.fromkeys(caption))[:600])
+        header_rows = sorted(
+            row_list,
+            key=lambda row: sum(
+                1 for keyword in header_keywords if keyword.lower() in row.lower()
+            ),
+            reverse=True,
+        )[:2]
+        headers = [
+            row for row in header_rows
+            if sum(1 for keyword in header_keywords if keyword.lower() in row.lower()) >= 2
+        ]
+        if headers:
+            sheet_bits.append("表頭：" + "；".join(headers)[:500])
+        data_rows = [
+            row for row in row_list
+            if re.search(r"狀況|状况", row)
+            and len(re.findall(r"-?\d+(?:\.\d+)?", row)) >= 2
+            and row not in headers
+        ][:max_rows]
+        if not data_rows:
+            data_rows = [
+                row for row in row_list
+                if len(re.findall(r"-?\d+(?:\.\d+)?", row)) >= 2 and row not in headers
+            ][:max_rows]
+        if data_rows:
+            sheet_bits.append("關鍵資料列：" + "；".join(data_rows)[:900])
+        if sheet_bits:
+            parts.append("\n".join(sheet_bits))
+
     if not parts:
         # Fall back to the first non-empty lines if the dump has no cell grid.
-        parts = [line.strip() for line in lines if line.strip()][:max_rows + 1]
-    text = "\n".join(parts)
-    return Cleaned(text=normalize_whitespace(text), rules=["spreadsheet_compacted"], before=before)
+        parts = [
+            CELL_COORD.sub("", line.strip())
+            for line in lines
+            if line.strip()
+        ][: max_rows + 1]
+    text = "\n\n".join(parts)
+    text = normalize_whitespace(text)
+    return Cleaned(text=text, rules=["spreadsheet_compacted"], before=before)
 
 
 def is_listing_page(text: str) -> bool:

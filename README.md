@@ -6,7 +6,8 @@ CLEC 语料清洗 ETL（Stage 1）。本仓库把只读原始采集目录
 - `dist/corpus.jsonl`：每行一个可检索段落（contract v2）
 - `dist/meta.json`：`clec stats` 直接读取的统计与已知缺口
 - `dist/etl-audit.md`：独立质量审计报告
-- `config/synonyms.json`：58 组高确定性金融/两岸/ASR 同义词
+- `dist/doc-manifest.jsonl`：逐文档段落产出清单（审计 `docs_with_zero_passages`）
+- `config/synonyms.json`：60 组高确定性金融/两岸/ASR 同义词
 - `config/source_policy.json`：9 类正文来源的开关与合规策略
 
 原始语料、清洗产物和压缩包均不入 Git。原始目录始终以只读方式打开。
@@ -16,6 +17,7 @@ CLEC 语料清洗 ETL（Stage 1）。本仓库把只读原始采集目录
 ```text
 clec-corpus/
 ├── .gitignore                 # dist/、raw/、*.jsonl、*.tar.zst、缓存
+├── pyproject.toml             # pytest pythonpath 配置
 ├── README.md
 ├── config/
 │   ├── synonyms.json          # 30–60 组同义词
@@ -28,7 +30,7 @@ clec-corpus/
 │   ├── schema.py              # contract v2 校验
 │   ├── build_corpus.py        # CLI 总入口
 │   └── audit_corpus.py        # 独立审计
-└── tests/                     # 清洗、去重、幻觉、切段、契约测试
+└── tests/                     # 清洗、去重、幻觉、切段、契约、回归测试
 ```
 
 ## 复现命令
@@ -120,8 +122,9 @@ python3 -m venv .venv
 
 1. **Drive archive 的 5 位数字不是集号。** `sources/drive/archive-transcripts/00001-01.srt`
    的组号是上传槽位；同组 MD 头部可能写着 `00012`、`00176` 甚至 `00566`。
-   ETL 先解析 MD 头部，再用 5-gram Jaccard 与 clectw 逐字稿做内容对齐；置信度不足时保留为
-   `drive-<group>`，绝不按槽位号硬绑集号。
+   ETL 先解析 MD 头部，再用 5-gram containment（≥ 0.45）与 clectw 逐字稿/摘要做内容对齐，
+   并校验时长差不超过 30%；置信度不足时保留为 `drive-<group>`，绝不按槽位号硬绑集号，
+   也绝不覆盖原始 clectw 逐字稿。
 2. **clectw `text/ep/` 页面是“摘要 + 页内嵌逐字稿”的混合页。**
    2156 页中 722 页有 `本週課程概述`，1431 页只有摘要后直接接逐字稿，3 页是隔离集摘要。
    ETL 在 `※ 本週報由 AI…` / `※ 逐字稿由影片語音…` 处切开，`kind=summary` 只取摘要，
@@ -133,7 +136,12 @@ python3 -m venv .venv
 5. **clec168 的 2,153 个视频介绍页不进入正文。** 博客、书籍章节和简报页正常入库；
    与 Drive PDF 内容重复的页面由 MinHash 合并，保留最完整版本。
 6. **电子表格不能按单元格入库。** `text/local` 的 6 份 `.xlsx` 文本转储只保留
-   工作表名、表头和少量关键汇总行。
+   工作表名、情景参数（30% / 50%）、表头、关键数值汇总行；单元格坐标
+   （`B11:` / `C12:`）与本机绝对路径全部剥离。
+7. **多版本书籍只保留最新/最完整版本。** `The-Wisdom-of-CLEC_EN`、
+   `CLEC宝典_SC`、`CLEC寶典_ZH`、`理財聖經CLEC版` 等按“归一化书名 + 语言/文字”
+   分组，保留版本号最高者（同版本再取正文最长者），避免 V1.5.1 与 V1.14.2
+   同时入库造成大量重复。切段后还会对跨 `work_id` 完全相同的 `body` 做精确去重。
 
 统计口径提示：`clec168_blog`、`clec168_presentations` 的页面数远大于最终
 `source_type` 文档数，因为其中大量页面与 Drive PDF 是同一篇内容，MinHash
@@ -144,18 +152,24 @@ clectw 纯文本逐字稿会被同作品同类型合并。正文内容没有丢�
 ## 最近一次真实验收（全量）
 
 - 原始文件读取：7,816 个；原始字符：120,708,879
-- 去重前文档：7,788；去重后：5,358；段落：58,379
-- 作品数：2,541；来源数：5,352
-- 类型：`doc` 21,148 / `transcript` 26,205 / `qa` 419 / `summary` 10,607
-- 质量：q1 21,148 / q2 26,385 / q3 10,607 / q4 239
-- 模板正则命中：0 / 58,379 = 0.0000%（阈值 < 0.5%）
-- `ep-00176/00260/00295` 泄露：0；`known_gaps` 完整
+- 去重前文档：7,771；去重后：5,367；段落：50,646
+- 作品数：2,817；来源数：5,359
+- 类型：`doc` 11,698 / `transcript` 27,955 / `qa` 419 / `summary` 10,574
+- 质量：q1 11,698 / q2 28,268 / q3 10,574 / q4 106
+- 模板正则命中：95 / 50,646 = 0.1876%（阈值 < 0.5%；含制式页尾/播客/社交链接）
+- `ep-00176/00260/00295` 泄露：0；真实 Drive 槽位 `00269/00221/00300`：0；内容指纹：0；`known_gaps` 完整
+- `ep-02xxx` 伪年份作品：0（修复前 10 个作品 / 2,978 段）
+- `date == 2026-11-06` 采集日污染：0（修复前 1,918 段 / 87 作品）
 - Drive 同组 TXT/SRT/MD 重复：0
-- 同 `work_id` 同时含 `transcript` + `summary`：2,125（阈值 ≥ 2,000）
+- 同源 `(start_sec, end_sec)` 重复：0；同源时间戳重叠：0（修复前 5,461 段重复区间）
+- 跨 `work_id` 完全相同 `body`：0
+- `docs_with_zero_passages`：0 / 5,367
+- 同 `work_id` 同时含 `transcript` + `summary`：2,148（阈值 ≥ 2,000）
 - clec168 纯视频介绍页入正文：0
-- 100–900 字段落：58,379 / 58,379 = 100.00%（阈值 ≥ 95%）
+- 100–900 字段落：50,643 / 50,646 = 99.99%（阈值 ≥ 95%）
+- 多版本书籍淘汰：17 个旧/重复版本；跨 work 完全重复段落删除：950
 - 全量 `license_mode=full`
-- 单元测试：32 passed
+- 单元测试：58 passed
 
 完整报告见 `dist/etl-audit.md`（不提交 Git）。
 

@@ -3,11 +3,12 @@
 A transcript passage is marked ``quality=4`` (suspect) when at least one of
 three independent signals fires:
 
-1. zlib compression ratio > 2.4 (uncompressed UTF-8 bytes / compressed bytes);
-2. a >= 5-character phrase repeats at high density (>= 4 occurrences and
-   covers at least 12% of the passage);
-3. an isolated subtitle-credit / "please subscribe" hallucination phrase
-   appears at a passage boundary or as a standalone credit.
+1. zlib compression ratio > 3.0 (uncompressed UTF-8 bytes / compressed bytes),
+   high enough that normal spoken Chinese does not trip it;
+2. a >= 8-character CJK phrase with at least five distinct characters repeats
+   at high density (>= 4 occurrences and covers at least 18% of the passage);
+3. a high-specificity subtitle-credit hallucination phrase appears anywhere,
+   or a generic "thanks for watching" phrase is the whole passage.
 
 The gate is deliberately conservative: it marks for down-weighting, it does
 not delete text.  The real quarantine episodes are handled separately by a
@@ -21,27 +22,36 @@ import unicodedata
 import zlib
 from dataclasses import dataclass
 
-COMPRESSION_THRESHOLD = 2.4
+COMPRESSION_THRESHOLD = 3.0
 REPEAT_MIN_COUNT = 4
-REPEAT_MIN_COVERAGE = 0.12
-NGRAM_SIZE = 5
+REPEAT_MIN_COVERAGE = 0.18
+CJK_NGRAM = 8
 
-CJK_OR_WORD = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaffA-Za-z0-9]+")
+CJK_ONLY = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+WORD_OR_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaffA-Za-z0-9]+")
 
-KNOWN_HALLUCINATION_PHRASES = (
-    "字幕由amara.org社区提供",
-    "字幕由amara.org社群提供",
-    "字幕由amaraorg",
-    "amara.org",
+# Phrases that are unambiguously inserted by a subtitle group / Whisper
+# artefact and may appear in the middle of an otherwise normal passage.
+HIGH_SPECIFICITY_PHRASES = (
     "請不吝點贊訂閱轉發打賞支持明鏡與點點欄目",
     "请不吝点赞订阅转发打赏支持明镜与点点栏目",
     "明鏡與點點欄目",
     "明镜与点点栏目",
-    "中文字幕由",
-    "字幕志愿者",
+    "字幕由amara.org社区提供",
+    "字幕由amara.org社群提供",
+    "字幕由amaraorg",
+    "amara.org",
     "字幕志願者",
+    "字幕志愿者",
+    "www.zeebee.com",
+    "中文字幕由",
     "字幕組提供",
     "字幕组提供",
+)
+
+# Generic spoken / site phrases: only suspicious when they are essentially the
+# whole passage, otherwise a real sign-off would be mislabelled.
+LOW_SPECIFICITY_PHRASES = (
     "感謝您的觀看",
     "感谢您的观看",
     "感謝觀看",
@@ -60,7 +70,6 @@ KNOWN_HALLUCINATION_PHRASES = (
     "thankyouforwatching",
     "subscribed",
     "subtitlesby",
-    "www.zeebee.com",
 )
 
 
@@ -80,7 +89,7 @@ def _normalise(text: str) -> str:
 
 
 def _compact(text: str) -> str:
-    return "".join(CJK_OR_WORD.findall(_normalise(text)))
+    return "".join(WORD_OR_CJK.findall(_normalise(text)))
 
 
 def compression_ratio(text: str) -> float:
@@ -92,30 +101,42 @@ def compression_ratio(text: str) -> float:
 
 
 def _repeat_signal(text: str) -> tuple[int, float, str]:
-    compact = _compact(text)
-    if len(compact) < NGRAM_SIZE:
-        return 0, 0.0, ""
-    counts: dict[str, int] = {}
-    for index in range(len(compact) - NGRAM_SIZE + 1):
-        gram = compact[index:index + NGRAM_SIZE]
-        counts[gram] = counts.get(gram, 0) + 1
-    phrase, count = max(counts.items(), key=lambda item: (item[1], item[0]))
-    coverage = (count * NGRAM_SIZE) / max(1, len(compact))
-    return count, coverage, phrase
+    normalised = _normalise(text)
+    best: tuple[int, float, str] = (0, 0.0, "")
+
+    cjk = "".join(CJK_ONLY.findall(normalised))
+    if len(cjk) >= CJK_NGRAM:
+        counts: dict[str, int] = {}
+        for index in range(len(cjk) - CJK_NGRAM + 1):
+            gram = cjk[index:index + CJK_NGRAM]
+            counts[gram] = counts.get(gram, 0) + 1
+        phrase, count = max(counts.items(), key=lambda item: (item[1], item[0]))
+        coverage = (count * CJK_NGRAM) / max(1, len(cjk))
+        # A phrase made of one or two repeating characters ("謝謝謝謝",
+        # "美元美元美元") is normal spoken emphasis, not a Whisper loop.
+        if (
+            count >= REPEAT_MIN_COUNT
+            and coverage >= REPEAT_MIN_COVERAGE
+            and len(set(phrase)) >= 5
+        ):
+            best = (count, coverage, phrase)
+    return best
 
 
 def _phrase_signal(text: str) -> str:
     compact = _compact(text)
     if not compact:
         return ""
-    for phrase in KNOWN_HALLUCINATION_PHRASES:
+    for phrase in HIGH_SPECIFICITY_PHRASES:
+        needle = _compact(phrase)
+        if needle and needle in compact:
+            return phrase
+    for phrase in LOW_SPECIFICITY_PHRASES:
         needle = _compact(phrase)
         if not needle or needle not in compact:
             continue
-        position = compact.find(needle)
-        at_boundary = position <= 2 or position + len(needle) >= len(compact) - 2
-        standalone = len(needle) >= 4 and len(compact) <= len(needle) * 4
-        if at_boundary or standalone:
+        standalone = len(compact) <= len(needle) * 3
+        if standalone:
             return phrase
     return ""
 
@@ -126,7 +147,7 @@ def check_transcript(body: str) -> HallucinationResult:
     boundary_phrase = _phrase_signal(body)
     reasons: list[str] = []
     if ratio > COMPRESSION_THRESHOLD:
-        reasons.append(f"zlib_ratio={ratio:.3f}>2.4")
+        reasons.append(f"zlib_ratio={ratio:.3f}>3.0")
     if count >= REPEAT_MIN_COUNT and coverage >= REPEAT_MIN_COVERAGE:
         reasons.append(
             f"repeat={count}x,coverage={coverage:.3f},phrase={phrase!r}"

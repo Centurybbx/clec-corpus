@@ -182,6 +182,11 @@ def deduplicate_documents(
             match = None
             for other_id in candidates:
                 other = next(d for d in existing if d["source_id"] == other_id)
+                if kind == "transcript" and other["work_id"] != doc["work_id"]:
+                    # A low-confidence Drive SRT keeps its own drive-<group>
+                    # work id; it must never swallow the original clectw
+                    # verbatim transcript through fuzzy matching.
+                    continue
                 left_len = len(normalise_for_shingles(doc.get("text", "")))
                 right_len = len(normalise_for_shingles(other.get("text", "")))
                 if max(left_len, right_len) and min(left_len, right_len) / max(left_len, right_len) < 0.5:
