@@ -16,10 +16,12 @@ import hashlib
 import json
 import re
 import sys
+import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import quote, urlparse
 
 from . import chunk, clean, dedup, hallucination, schema
 
@@ -76,6 +78,79 @@ def relpath(path: Path, root: Path) -> str:
         return str(path.relative_to(root))
     except ValueError:
         return str(path)
+
+
+CLEC_MD_BASE = "https://fraserlai.github.io/clec-md"
+
+
+def valid_http_url(value: object) -> str:
+    """Return *value* only when it is a usable absolute HTTP(S) URL."""
+    text = str(value or "").strip().strip("'\"")
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    return text
+
+
+def astro_slug(value: object) -> str:
+    """Reproduce the slug Astro's glob loader generates (github-slugger).
+
+    Astro lowercases content IDs, removes punctuation, and turns literal
+    spaces into hyphens.  Unicode letters (including CJK) and existing
+    hyphens/underscores are preserved.  This matches every live clec-md
+    knowledge and post route in ``sitemap-0.xml``.
+    """
+    text = str(value or "").lower()
+    text = re.sub(r"[^\w\- ]+", "", text, flags=re.UNICODE)
+    return text.replace(" ", "-")
+
+
+def clec_md_knowledge_url(lang: str, category: str, slug: str) -> str:
+    """Canonical live URL for a clec-md knowledge page."""
+    prefix = "en/" if lang == "en" else ""
+    category_segment = quote(astro_slug(category), safe="")
+    slug_segment = quote(astro_slug(slug), safe="")
+    return f"{CLEC_MD_BASE}/{prefix}{category_segment}/{slug_segment}/"
+
+
+def clec_md_post_url(relative_path: str | Path) -> str:
+    """Canonical live URL for a clec-md post.
+
+    The ``posts/[...slug]`` route passes the content entry ID straight through,
+    so nested archive folders stay in the URL.
+    """
+    text = str(relative_path).replace("\\", "/").strip("/")
+    if text.endswith(".md"):
+        text = text[:-3]
+    segments = [
+        quote(astro_slug(part), safe="")
+        for part in text.split("/")
+        if part
+    ]
+    return f"{CLEC_MD_BASE}/posts/{'/'.join(segments)}/"
+
+
+def resolve_podcast_origin(meta: dict, podcast_meta: dict[str, dict]) -> str:
+    """Pick the best provenance URL for an ASR transcript.
+
+    A human-browsable episode page wins over the raw media enclosure.  Feed
+    filenames such as ``ximalaya-110339131.xml`` are deliberately rejected.
+    """
+    guid = str(meta.get("source_guid", "")).strip()
+    entry = podcast_meta.get(guid, {})
+    candidates = (
+        entry.get("link"),
+        meta.get("source"),
+        meta.get("media_url"),
+        entry.get("enclosure"),
+    )
+    for candidate in candidates:
+        url = valid_http_url(candidate)
+        if url:
+            return url
+    return ""
 
 
 def is_blocked(work_id: str) -> bool:
@@ -582,6 +657,12 @@ class Builder:
             title = clean.normalize_title(str(front.get("title", path.stem)))
             slug = safe_slug(path.stem)
             work_id = f"kb-{lang}-{safe_slug(category or 'general')}-{slug}"
+            origin_url = valid_http_url(front.get("sourceUrl"))
+            if not origin_url:
+                # The Astro route is /<folder>/<id-slug>/ (or /en/<folder>/...);
+                # use the containing folder when frontmatter omits the category.
+                category_segment = relative_parts[-2] if len(relative_parts) > 1 else category
+                origin_url = clec_md_knowledge_url(lang, category_segment, path.stem)
             doc = make_doc(
                 work_id=work_id,
                 source_id=f"cmd_kb_{lang}_{safe_slug(category or 'general')}_{slug}",
@@ -592,7 +673,7 @@ class Builder:
                 source_path=path,
                 source_dir=self.root,
                 date_value=front.get("date"),
-                origin_url=str(front.get("sourceUrl", "")).strip().strip("'\""),
+                origin_url=origin_url,
                 rules=cleaned.rules,
                 raw_before=raw,
             )
@@ -607,6 +688,9 @@ class Builder:
             slug = safe_slug(path.stem)
             identifier = re.search(r"(?<!\d)(\d{1,4})(?![0-9])", path.stem)
             work_id = f"post-{slug}"
+            origin_url = valid_http_url(front.get("sourceUrl"))
+            if not origin_url:
+                origin_url = clec_md_post_url(path.relative_to(root / "posts"))
             doc = make_doc(
                 work_id=work_id,
                 source_id=f"cmd_post_{slug}",
@@ -617,7 +701,7 @@ class Builder:
                 source_path=path,
                 source_dir=self.root,
                 date_value=front.get("date"),
-                origin_url=str(front.get("sourceUrl", "")).strip().strip("'\""),
+                origin_url=origin_url,
                 rules=cleaned.rules,
                 raw_before=raw,
             )
@@ -791,7 +875,7 @@ class Builder:
                     or (cues[0].text if cues else sub.name)
                 )
                 date_value = self._podcast_date(meta)
-                origin_url = meta.get("source") or meta.get("media_url") or ""
+                origin_url = resolve_podcast_origin(meta, self.podcast_meta)
                 doc = make_doc(
                     work_id=work_id,
                     source_id=f"{label}_{safe_slug(sub.name)}",
@@ -802,7 +886,7 @@ class Builder:
                     source_path=srt_path or sub,
                     source_dir=self.root,
                     date_value=date_value,
-                    origin_url=origin_url if str(origin_url).startswith("http") else "",
+                    origin_url=origin_url,
                     cues=cues,
                     rules=["asr_srt_preferred"] if srt_path else [],
                     raw_before=raw,
@@ -813,6 +897,7 @@ class Builder:
         result: dict[str, dict] = {}
         if not self.enabled("podcast_metadata"):
             return result
+        rss_links = self._podcast_rss_links()
         inventory = self.root / "sources/podcast/episode-inventory.jsonl"
         if inventory.exists():
             for line in read_text(inventory).splitlines():
@@ -823,14 +908,46 @@ class Builder:
                 guid = str(row.get("guid", "")).strip()
                 if not guid:
                     continue
+                matches = row.get("possible_matches") or []
+                match_url = ""
+                if matches:
+                    match_url = valid_http_url(matches[0].get("url"))
                 result[guid] = {
                     "published": row.get("published"),
                     "title": row.get("title", ""),
-                    "link": (row.get("possible_matches") or [{}])[0].get("url", "")
-                    if row.get("possible_matches") else "",
-                    "enclosure": row.get("enclosure_url", ""),
+                    # A matched clectw page is best; otherwise fall back to the
+                    # original podcast page from the RSS item rather than the
+                    # raw audio enclosure.
+                    "link": match_url or rss_links.get(guid, ""),
+                    "enclosure": valid_http_url(row.get("enclosure_url")),
                 }
         return result
+
+    def _podcast_rss_links(self) -> dict[str, str]:
+        """Map RSS GUIDs to their human-browsable episode page links."""
+        links: dict[str, str] = {}
+        directory = self.root / "sources/podcast"
+        if not directory.exists():
+            return links
+        for path in sorted(directory.glob("*.xml")):
+            try:
+                root = ET.parse(path).getroot()
+            except (ET.ParseError, OSError):
+                continue
+            for item in root.iter():
+                if item.tag.rsplit("}", 1)[-1] != "item":
+                    continue
+                guid = ""
+                link = ""
+                for child in item:
+                    name = child.tag.rsplit("}", 1)[-1]
+                    if name == "guid" and not guid:
+                        guid = (child.text or "").strip()
+                    elif name == "link" and not link:
+                        link = valid_http_url(child.text)
+                if guid and link:
+                    links.setdefault(guid, link)
+        return links
 
     def _podcast_date(self, meta: dict) -> str | None:
         guid = str(meta.get("source_guid", "")).strip()
