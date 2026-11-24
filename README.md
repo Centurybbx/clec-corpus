@@ -1,9 +1,9 @@
 # clec-corpus
 
-CLEC 语料清洗 ETL（Stage 1）。本仓库把只读原始采集目录
+CLEC 语料清洗 ETL。本仓库把只读原始采集目录
 `/Users/century/Vibing/clec/collection/` 转换为版本化、可审计的标准数据包：
 
-- `dist/corpus.jsonl`：每行一个可检索段落（contract v2）
+- `dist/corpus.jsonl`：每行一个可检索段落
 - `dist/meta.json`：`clec stats` 直接读取的统计与已知缺口
 - `dist/etl-audit.md`：独立质量审计报告
 - `dist/doc-manifest.jsonl`：逐文档段落产出清单（审计 `docs_with_zero_passages`）
@@ -27,7 +27,7 @@ clec-corpus/
 │   ├── dedup.py               # work_id 对齐、5-gram MinHash、含括率去重
 │   ├── hallucination.py       # Whisper 幻觉门禁
 │   ├── chunk.py               # 400–600 字自然语义切段 + 时间戳
-│   ├── schema.py              # contract v2 校验
+│   ├── schema.py              # 语料契约校验
 │   ├── build_corpus.py        # CLI 总入口
 │   └── audit_corpus.py        # 独立审计
 └── tests/                     # 清洗、去重、幻觉、切段、契约、回归测试
@@ -36,7 +36,7 @@ clec-corpus/
 ## 复现命令
 
 ```bash
-cd /Users/century/Vibing/clec-corpus
+cd /Users/century/Vibing/clec/clec-corpus
 
 # 1) 全量清洗（只读 collection，输出到 gitignored 的 dist/）
 python3 -m etl.build_corpus \
@@ -61,7 +61,7 @@ python3 -m venv .venv
 .venv/bin/python -m pytest -q
 ```
 
-## 跨仓库契约（v2）
+## 跨仓库契约
 
 `corpus.jsonl` 每行字段：
 

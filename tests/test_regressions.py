@@ -1,4 +1,4 @@
-"""Regression tests for the Stage-1 P0/P1 fixes."""
+"""Regression tests for ETL defects and audit invariants."""
 
 from __future__ import annotations
 

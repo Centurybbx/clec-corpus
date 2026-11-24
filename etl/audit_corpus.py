@@ -1,7 +1,7 @@
 """Independent quality audit for the CLEC corpus.
 
 This script does not trust the build report.  It reads every line of
-``dist/corpus.jsonl``, independently verifies the Stage-1 hard thresholds and
+``dist/corpus.jsonl``, independently verifies the corpus hard thresholds and
 the new P0/P1 invariants, and writes ``dist/etl-audit.md``.  All audit samples
 are selected from the final ``corpus.jsonl``.
 """

@@ -12,7 +12,7 @@ The chunker never intentionally cuts in the middle of a sentence.  A guarded
 fallback only splits a single run-on sentence at a comma, or finally at the
 900-character hard ceiling, when no punctuation exists at all.
 
-Short but meaningful sections (40-99 characters) are preserved: the Stage-1
+Short but meaningful sections (40-99 characters) are preserved: the corpus
 spec allows up to 5% of passages to fall outside 100-900 characters.  Only
 fragments shorter than ``MIN_FRAGMENT`` are discarded.
 """
@@ -255,7 +255,7 @@ def merge_short(passages: list[Passage], hard_max: int = HARD_MAX) -> list[Passa
     """Merge short neighbours where possible; keep 20-99 character sections.
 
     The previous implementation silently discarded every passage under 100
-    characters.  Stage-1 permits up to 5% of passages outside 100-900
+    characters.  The spec permits up to 5% of passages outside 100-900
     characters, so only genuinely meaningless fragments are removed later.
     """
     if not passages:
