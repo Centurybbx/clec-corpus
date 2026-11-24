@@ -9,6 +9,7 @@ CLEC 语料清洗 ETL。本仓库把只读原始采集目录
 - `dist/doc-manifest.jsonl`：逐文档段落产出清单（审计 `docs_with_zero_passages`）
 - `config/synonyms.json`：60 组高确定性金融/两岸/ASR 同义词
 - `config/source_policy.json`：9 类正文来源的开关与合规策略
+- `dist/manifest.json`：GitHub Release 清单（SHA-256、字节数、下载地址、统计与 `known_gaps`）
 
 原始语料、清洗产物和压缩包均不入 Git。原始目录始终以只读方式打开。
 
@@ -19,6 +20,7 @@ clec-corpus/
 ├── .gitignore                 # dist/、raw/、*.jsonl、*.tar.zst、缓存
 ├── pyproject.toml             # pytest pythonpath 配置
 ├── README.md
+├── LICENSE                    # MIT
 ├── config/
 │   ├── synonyms.json          # 30–60 组同义词
 │   └── source_policy.json     # 来源开关；合规来源默认 full
@@ -29,7 +31,8 @@ clec-corpus/
 │   ├── chunk.py               # 400–600 字自然语义切段 + 时间戳
 │   ├── schema.py              # 语料契约校验
 │   ├── build_corpus.py        # CLI 总入口
-│   └── audit_corpus.py        # 独立审计
+│   ├── audit_corpus.py        # 独立审计
+│   └── publish_manifest.py    # GitHub Release 清单（SHA-256、下载地址）
 └── tests/                     # 清洗、去重、幻觉、切段、契约、回归测试
 ```
 
@@ -60,6 +63,35 @@ python3 -m venv .venv
 .venv/bin/pip install pytest
 .venv/bin/python -m pytest -q
 ```
+
+## 打包与发布数据包（GitHub Releases）
+
+Rust 引擎把 `dist/corpus.jsonl` 编译为检索索引并顺带打包语料；`etl.publish_manifest`
+读取 `dist/meta.json`、流式计算压缩包的 SHA-256 与字节数，生成 `dist/manifest.json`
+供客户端校验下载。发布前先构建好 `clec-cli`：
+
+```bash
+cd /Users/century/Vibing/clec/clec-corpus
+
+# 1) 清洗语料，产出 dist/corpus.jsonl 与 dist/meta.json
+python3 -m etl.build_corpus --source-dir /Users/century/Vibing/clec/collection --out-dir dist
+
+# 2) 编译索引并打包语料，产出 dist/index/ 与 dist/corpus.tar.zst
+../clec-cli/target/release/clec build --input dist/corpus.jsonl --meta dist/meta.json --synonyms config/synonyms.json --output dist/index --pack-zst dist/corpus.tar.zst
+
+# 3) 生成发布清单，产出 dist/manifest.json（sha256 / size_bytes / archive_url）
+python3 -m etl.publish_manifest --archive dist/corpus.tar.zst --meta dist/meta.json --tag corpus-$(date +%Y-%m-%d) --out dist/manifest.json
+
+# 4) 创建 GitHub Release，上传压缩包与清单
+gh release create corpus-$(date +%Y-%m-%d) dist/corpus.tar.zst dist/manifest.json --title "..." --notes "..."
+```
+
+`manifest.json` 固定包含 `schema_version`（必须为 2）、`pack_name`、`pack_version`、
+`built_at`、`archive_url`、`mirrors`、`sha256`、`size_bytes`、`counts`、`known_gaps`。
+默认下载地址为 `https://github.com/{repo}/releases/download/{tag}/{archive.name}`；
+可用 `--repo` 指定仓库（默认 `Centurybbx/clec-corpus`）、`--archive-url` 覆盖完整地址、
+重复传 `--mirror <URL>` 追加镜像。压缩包或 meta 缺失、JSON 非法、`schema_version`
+不是 2 时，命令以非零码退出并打印明确错误。
 
 ## 跨仓库契约
 
@@ -169,7 +201,8 @@ clectw 纯文本逐字稿会被同作品同类型合并。正文内容没有丢�
 - 100–900 字段落：50,643 / 50,646 = 99.99%（阈值 ≥ 95%）
 - 多版本书籍淘汰：17 个旧/重复版本；跨 work 完全重复段落删除：950
 - 全量 `license_mode=full`
-- 单元测试：58 passed
+- `origin_url` 覆盖：49,390 / 50,646 = 97.52%（`podcast_asr`、`clec_md` 均 100%）
+- 单元测试：72 passed
 
 完整报告见 `dist/etl-audit.md`（不提交 Git）。
 
